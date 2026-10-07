@@ -1497,13 +1497,27 @@ impl DocTextures {
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&res.mip_sampler) },
                     ],
                 });
+                // Keep the sampled source and render attachment in separate resources. Some
+                // Intel DX12 drivers corrupt reduced previews when both are mip levels of
+                // the same texture, even though the subresources do not overlap.
+                let scratch = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("pc_mip_scratch"),
+                    size: wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let scratch_view = scratch.create_view(&Default::default());
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("pc_mip"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &t.levels[level],
+                        view: &scratch_view,
                         resolve_target: None,
                         depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -1514,6 +1528,13 @@ impl DocTextures {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
                 pass.draw(0..3, 0..1);
+                drop(pass);
+                let origin = wgpu::Origin3d { x: x0, y: y0, z: 0 };
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &scratch, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &t.texture, mip_level: level as u32, origin, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: x1 - x0, height: y1 - y0, depth_or_array_layers: 1 },
+                );
             }
         }
         queue.submit([encoder.finish()]);
