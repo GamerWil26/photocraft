@@ -147,7 +147,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 }
             }
             resp.context_menu(|ui| {
-                ui.label(tl!("Function key"));
+                ui.label(tl!("Keyboard Shortcuts"));
                 let current = app.session.prefs().shortcuts.get(&shortcut_id(name)).cloned().unwrap_or_default();
                 for key in std::iter::once(String::new()).chain((1..=12).map(|n| format!("F{n}"))) {
                     let label = if key.is_empty() { tl!("None").to_string() } else { key.clone() };
