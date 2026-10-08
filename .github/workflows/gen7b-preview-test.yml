@@ -1,0 +1,22 @@
+name: Windows preview test build
+on:
+  push:
+    branches: [test/gen7b-action-keys]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build test app
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_DEV_OPT_LEVEL: 1
+        run: cargo build --locked -p photocraft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-windows-preview-test
+          path: target/debug/photocraft.exe
