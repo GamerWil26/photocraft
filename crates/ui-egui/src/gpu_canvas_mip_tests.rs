@@ -58,12 +58,20 @@ fn canvas_mips_preserve_opaque_pixels_and_partial_updates() {
     };
     eprintln!("mip readback adapter: {:?}", rs.adapter.get_info());
     let gpu = GpuCanvas::new(&rs);
+    // Both mip paths: straight into the level, and the DX12 scratch-texture workaround.
+    for separate in [false, true] {
+        gpu.rs.renderer.write().callback_resources.get_mut::<Resources>().unwrap().separate_mip_targets = separate;
+        check_mips(&gpu);
+    }
+}
+
+fn check_mips(gpu: &GpuCanvas) {
     for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
         for (w, h) in [(1791, 1083), (513, 1), (1, 513)] {
             let mut full = Buffer::filled(Rect::from_xywh(0, 0, w, h), [0.25, 0.5, 0.75, 1.0]);
             // Reusing the key also covers replacing textures after a size or depth change.
             gpu.upload_buffer_full(1, &full, depth);
-            for (level, pixels) in read_mips(&gpu, 1).iter().enumerate() {
+            for (level, pixels) in read_mips(gpu, 1).iter().enumerate() {
                 for pixel in pixels {
                     assert!((pixel[3] - 1.0).abs() < 0.001, "{depth:?} {w}x{h} mip {level}: {pixel:?}");
                     for (actual, expected) in pixel.iter().zip([0.25, 0.5, 0.75, 1.0]) {
@@ -80,8 +88,8 @@ fn canvas_mips_preserve_opaque_pixels_and_partial_updates() {
                 }
             }
             gpu.upload_buffer_full(2, &full, depth);
-            let partial = read_mips(&gpu, 1);
-            let rebuilt = read_mips(&gpu, 2);
+            let partial = read_mips(gpu, 1);
+            let rebuilt = read_mips(gpu, 2);
             for (level, (actual, expected)) in partial.iter().zip(&rebuilt).enumerate() {
                 for (a, b) in actual.iter().zip(expected) {
                     assert!((a[3] - 1.0).abs() < 0.001, "partial {depth:?} mip {level}: {a:?}");
