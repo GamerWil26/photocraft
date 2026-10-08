@@ -167,21 +167,34 @@ fn record(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"action": name, "index": idx}))
 }
 
-fn stop(s: &mut Session, _p: &Value) -> Result<Value> {
-    let Some((from, idx)) = s.actions.recording else {
-        return Err(bad("actions.stop", "not recording"));
-    };
+/// Replayable journal entries not yet committed to this action while recording.
+pub fn pending_steps(s: &Session, action: usize) -> impl Iterator<Item = &(String, Value)> {
+    let from = s.actions.recording.filter(|(_, i)| *i == action).map_or(s.journal.len(), |(from, _)| from);
+    s.journal.iter().skip(from).filter(|(id, _)| replayable(id))
+}
+
+fn flush_recording(s: &mut Session) -> Result<()> {
+    let Some((_, idx)) = s.actions.recording else { return Ok(()) };
     if idx >= s.actions.list.len() {
         return Err(bad("actions.stop", "the action being recorded no longer exists"));
     }
-    let steps: Vec<(String, Value)> = s.journal.iter().skip(from).filter(|(id, _)| replayable(id)).cloned().collect();
+    let steps: Vec<_> = pending_steps(s, idx).cloned().collect();
+    s.actions.recording = Some((s.journal.len(), idx));
+    if !steps.is_empty() {
+        s.actions.list[idx].steps.extend(steps);
+        s.actions.touch();
+    }
+    Ok(())
+}
+
+fn stop(s: &mut Session, _p: &Value) -> Result<Value> {
+    let Some((_, idx)) = s.actions.recording else {
+        return Err(bad("actions.stop", "not recording"));
+    };
+    flush_recording(s)?;
     s.actions.recording = None;
-    let action = &mut s.actions.list[idx];
-    action.steps.extend(steps);
-    let name = action.name.clone();
-    let n = action.steps.len();
-    s.actions.touch();
-    Ok(json!({"action": name, "steps": n}))
+    let action = &s.actions.list[idx];
+    Ok(json!({"action": action.name, "steps": action.steps.len()}))
 }
 
 fn run_recorded(s: &mut Session, steps: &[(String, Value)], from: usize) -> (u64, Option<Value>) {
@@ -217,10 +230,27 @@ fn play(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {
-    if s.actions.recording.is_some() {
-        return Err(bad("actions.delete", "stop recording first"));
-    }
     let idx = resolve(&s.actions.list, p, "actions.delete")?;
+    if let Some(step) = p.get("step") {
+        let step = step.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad("actions.delete", "step must be a non-negative integer"))?;
+        let len = s.actions.list[idx].steps.len().saturating_add(pending_steps(s, idx).count());
+        if step >= len {
+            return Err(bad("actions.delete", "step is out of range"));
+        }
+        // Commit pending entries before editing the action; never erase the command
+        // journal or undo the edit that produced the deleted recording step.
+        if s.actions.recording.is_some_and(|(_, i)| i == idx) {
+            flush_recording(s)?;
+        }
+        let action = &mut s.actions.list[idx];
+        action.steps.remove(step);
+        let result = json!({"action": action.name, "deletedStep": step, "steps": action.steps.len()});
+        s.actions.touch();
+        return Ok(result);
+    }
+    if s.actions.recording.is_some() {
+        return Err(bad("actions.delete", "stop recording before deleting an action"));
+    }
     let name = s.actions.list.remove(idx).name;
     s.actions.touch();
     Ok(json!({"deleted": name}))
@@ -283,7 +313,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Delete Action",
             menu: &[],
             shortcut: None,
-            params: r##"{"action":name|index} → {deleted:name}. Refused while recording."##,
+            params: r##"{"action":name|index, "step":index?} → {deleted:name} or {action, deletedStep, steps:count}. step is 0-based, including pending recorded steps. Whole-action deletion is refused while recording."##,
             enabled: always,
             run: delete,
             journal: false,
@@ -413,6 +443,42 @@ mod tests {
         assert_eq!(s.execute("actions.delete", json!({"action": "Grow"})).unwrap()["deleted"], "Grow");
         assert!(s.actions.list.is_empty());
         assert!(s.execute("actions.get", json!({"action": "Grow"})).is_err());
+    }
+
+    #[test]
+    fn delete_one_step_while_recording_keeps_journal_and_remaining_steps() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+        s.execute("actions.record", json!({"name": "Edit"})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Kept"})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Removed"})).unwrap();
+        let journal = s.journal.clone();
+        let rev = s.actions.rev;
+        let before = s.actions.clone();
+        for step in [json!(-1), json!(2), json!(0.5), json!(null), json!("0"), json!(u64::MAX)] {
+            assert!(s.execute("actions.delete", json!({"action": 0, "step": step})).is_err());
+            assert_eq!(s.actions, before, "invalid deletion is atomic");
+        }
+        assert_eq!(pending_steps(&s, 0).count(), 2);
+        let result = s.execute("actions.delete", json!({"action": 0, "step": 1})).unwrap();
+        assert_eq!(result["steps"], 1);
+        assert_eq!(s.journal, journal, "deleting a recording does not erase executed commands");
+        assert_eq!(s.active().unwrap().doc.layers.len(), 3, "it does not undo document edits");
+        assert!(s.actions.recording.is_some());
+        assert!(s.actions.rev > rev);
+        s.execute("layer.new.layer", json!({"name": "After"})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        assert_eq!(s.actions.list[0].steps.iter().map(|(_, p)| p["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Kept", "After"]);
+        s.execute("actions.delete", json!({"action": "Edit", "step": 0})).unwrap();
+        assert_eq!(s.actions.list[0].steps[0].1["name"], "After");
+        let saved = serde_json::to_string(&s.actions.list).unwrap();
+        s.actions.list = serde_json::from_str(&saved).unwrap();
+        s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+        assert_eq!(s.execute("actions.play", json!({"action": 0})).unwrap()["ran"], 1);
+        assert_eq!(s.active().unwrap().doc.layers[1].name, "After");
+        s.execute("actions.delete", json!({"action": 0, "step": 0})).unwrap();
+        assert_eq!(s.actions.list.len(), 1, "an empty action still exists");
+        assert!(s.actions.list[0].steps.is_empty());
     }
 
     #[test]
