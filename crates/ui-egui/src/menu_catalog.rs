@@ -643,7 +643,7 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["View"], "---", None, "---"),
     (&["View"], "Zoom In", Some("Cmd+="), "view.zoomIn"),
     (&["View"], "Zoom Out", Some("Cmd+-"), "view.zoomOut"),
-    (&["View"], "Fit on Screen", None, "view.fitOnScreen"),
+    (&["View"], "Fit on Screen", Some("Cmd+0"), "view.fitOnScreen"),
     (&["View"], "Fit Layer(s) on Screen", None, "view.fitLayersOnScreen"),
     (&["View"], "Fit Artboard on Screen", None, "view.fitArtboardOnScreen"),
     (&["View"], "100%", Some("Cmd+1"), "view.actualPixels"),

@@ -451,3 +451,24 @@ fn action_function_key_checks_automation_authorization() {
     assert_eq!(h.state().ui.status, "denied action playback");
     assert_eq!(active_name(&h), "paint");
 }
+
+#[test]
+fn fit_shortcut_records_and_f6_fits_the_resized_canvas() {
+    let mut h = harness();
+    h.state_mut().run("actions.record", json!({"name": "Resize and fit"})).unwrap();
+    h.state_mut().run("image.canvasSize", json!({"width": 1800, "height": 1080})).unwrap();
+    press(&mut h, "Cmd+0");
+    h.state_mut().run("actions.stop", json!({})).unwrap();
+    assert_eq!(h.state().session.actions.list[0].steps.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["image.canvasSize", "view.fitOnScreen"]);
+    let item = crate::menus::menu_items(h.state()).into_iter().find(|i| i.id == "view.fitOnScreen").unwrap();
+    assert_eq!(item.shortcut.as_deref(), Some("Cmd+0"));
+    crate::actions::assign_shortcut(h.state_mut(), "Resize and fit", "F6").unwrap();
+    h.state_mut().ui.views[0].zoom = 0.1;
+    h.state_mut().ui.views[0].center = [0.0, 0.0];
+    press(&mut h, "F6");
+    let view = &h.state().ui.views[0];
+    assert!(!view.fit_pending, "the real canvas frame consumed Fit on Screen");
+    assert!(view.zoom > 0.1 && view.zoom < 1.0, "{}", view.zoom);
+    assert_eq!(view.center, [900.0, 540.0]);
+    assert_eq!(h.state().ui.status, "Played 2 steps");
+}

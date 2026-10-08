@@ -61,7 +61,24 @@ impl ActionState {
 /// A journal entry worth replaying: the command records itself, and it is not an `actions.*`
 /// command (those would nest recording and playback).
 pub fn replayable(id: &str) -> bool {
-    !id.starts_with("actions.") && crate::commands::find(id).is_some_and(|c| c.journal)
+    !id.starts_with("actions.") && (shell_view_command(id) || crate::commands::find(id).is_some_and(|c| c.journal))
+}
+
+/// View-only menu commands recorded by the desktop shell. Headless playback reports
+/// them as unsupported instead of silently dropping them.
+pub fn shell_view_command(id: &str) -> bool {
+    matches!(id, "view.fitOnScreen" | "view.actualPixels" | "view.zoomIn" | "view.zoomOut")
+}
+
+/// Shared validation for headless and shell playback. Does not start playback.
+pub fn playback_plan(s: &Session, p: &Value) -> Result<(Action, usize)> {
+    if s.actions.playing > 0 {
+        return Err(bad("actions.play", "an action is already playing"));
+    }
+    let idx = resolve(&s.actions.list, p, "actions.play")?;
+    let action = s.actions.list.get(idx).cloned().ok_or_else(|| bad("actions.play", "no such action"))?;
+    let from = from_step(p, action.steps.len())?;
+    Ok((action, from))
 }
 
 fn always(_: &Session) -> std::result::Result<(), String> {
@@ -189,12 +206,7 @@ fn run_recorded(s: &mut Session, steps: &[(String, Value)], from: usize) -> (u64
 }
 
 fn play(s: &mut Session, p: &Value) -> Result<Value> {
-    if s.actions.playing > 0 {
-        return Err(bad("actions.play", "an action is already playing"));
-    }
-    let idx = resolve(&s.actions.list, p, "actions.play")?;
-    let action = s.actions.list[idx].clone();
-    let from = from_step(p, action.steps.len())?;
+    let (action, from) = playback_plan(s, p)?;
     s.actions.playing = s.actions.playing.saturating_add(1);
     let (ran, failed) = run_recorded(s, &action.steps, from);
     s.actions.playing = s.actions.playing.saturating_sub(1);

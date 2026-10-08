@@ -89,6 +89,21 @@ store expose and persist the same setting; scripts keep using canonical command 
 | `actions.play` | `{"action": name or index, "from": step?}`. `from` and `failed.step` are 0-based. Returns `{action, ran, failed?:{step, id, error}}` and still returns ok when a step fails, so a partial run is reported. Leaves one history step per step that ran. Refuses to play while a play is already running. On an untrusted session each step is authorized the same way as a top-level command |
 | `actions.delete` | `{"action": name or index}` → `{deleted}`. Refused while recording |
 
+Desktop actions also record and replay View › Fit on Screen (`view.fitOnScreen`),
+100% (`view.actualPixels`), Zoom In and Zoom Out through their menu commands or shortcuts.
+Select an action and press Record to append steps; the plus button starts a new action.
+A final `["view.fitOnScreen", {}]` step fits the resized document when the canvas is laid out.
+Headless playback reports unsupported view commands as failed steps.
+
+In the desktop Actions panel, right-click an action to assign a function key (F1–F12),
+or choose None to remove it. The binding follows the action name, regardless of the selected
+row, and is saved in preferences. For example, the existing `edit.keyboardShortcuts` command
+accepts `{"set":{"actions.play:My action":"F6"},"allowUnknown":true,"removeConflicts":false}`.
+A named action takes precedence over the ordinary menu shortcut while it exists and is bound;
+removing its binding or deleting it restores that menu shortcut. The panel moves a key away
+from another action when assigning it. Action playback still checks each nested command's
+automation permissions.
+
 UI-level commands (`view.zoomIn`, `window.theme.pro`, `edit.search`, …) are also accepted by `engine.execute` and `ui.menu.invoke`.
 
 Commands that read or write files by path, instead of through the automation roots, are refused with "automation command `…` uses ambient filesystem paths and is disabled; use capability-scoped document methods". That covers every `file.*` command except `file.new`, the `file.close*` commands and a few path-free ones such as `file.fileInfo`, so `file.open`, `file.save`, `file.saveAs` and `file.saveACopy` always fail here: open and save with `app.open` / `app.save`. Path parameters of other commands (`layer.exportAs {path}`, `filter.distort.displace {mapPath}`, preset imports, and plug-in install/reload) are refused the same way. `prefs.set` rejects whole-preference updates and file-backed sections (`colorSettings`, `scriptEvents`, `historyLog`, `plugIns` and `scratchDisks`) so automation cannot configure ambient file access indirectly. The desktop app also refuses `image.mode.*`, which can load the colour profiles set in its preferences. The rules are in `crates/automation/src/workspace.rs`.

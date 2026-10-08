@@ -628,7 +628,13 @@ impl PhotocraftApp {
             }
         }
         // Long commands become background jobs when enabled (`jobs_ui`); the rest run inline.
-        let r = jobs_ui::run(self, id, params);
+        let r = if id == "actions.play" {
+            actions::play(self, &params)
+        } else if photocraft_engine::actions_cmds::shell_view_command(id) {
+            actions::run_view(self, id, params)
+        } else {
+            jobs_ui::run(self, id, params)
+        };
         if r.is_ok() && matches!(id, "edit.copy" | "edit.cut" | "edit.copyMerged") {
             self.clip_external = false;
             self.export_os_clipboard();

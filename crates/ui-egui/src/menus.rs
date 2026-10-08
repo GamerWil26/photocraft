@@ -258,17 +258,7 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
             }
         }
         "file.saveAs" => app.save_as(params.get("path").and_then(Value::as_str).map(str::to_string)).map(|(p, w)| json!({"path": p, "warnings": w})),
-        "view.zoomIn" | "view.zoomOut" | "view.fitOnScreen" | "view.actualPixels" => {
-            let i = app.session.active_index().ok_or("no document")?;
-            let v = &mut app.ui.views[i];
-            match id {
-                "view.zoomIn" => v.zoom = crate::canvas::zoom_step(v.zoom, 1),
-                "view.zoomOut" => v.zoom = crate::canvas::zoom_step(v.zoom, -1),
-                "view.fitOnScreen" => v.fit_pending = true,
-                _ => v.zoom = 1.0,
-            }
-            Ok(Value::Null)
-        }
+        "view.zoomIn" | "view.zoomOut" | "view.fitOnScreen" | "view.actualPixels" => app.run(id, params),
         "window.newWindowForDocument" => {
             let doc = app.session.active_index().ok_or("no document")?;
             let wid = app.ui.alloc_id();
