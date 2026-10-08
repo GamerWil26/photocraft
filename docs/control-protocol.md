@@ -87,7 +87,14 @@ store expose and persist the same setting; scripts keep using canonical command 
 | `actions.record` | `{"name":"Red"}` starts a new action (default name `Action N`). `{"action": name or index}` appends to one that exists |
 | `actions.stop` | `{}` → `{action, steps}`. Copies replayable journal entries since `actions.record` (queries and `actions.*` omitted) |
 | `actions.play` | `{"action": name or index, "from": step?}`. `from` and `failed.step` are 0-based. Returns `{action, ran, failed?:{step, id, error}}` and still returns ok when a step fails, so a partial run is reported. Leaves one history step per step that ran. Refuses to play while a play is already running. On an untrusted session each step is authorized the same way as a top-level command |
-| `actions.delete` | `{"action": name or index}` → `{deleted}`. Refused while recording |
+| `actions.delete` | `{"action": name or index, "step": index?}`. With a zero-based `step`: `{action, deletedStep, steps}`, also allowed while recording. Without `step`: `{deleted}`, refused while recording |
+
+The Actions panel shows replayable steps immediately while recording. Click an individual
+step to select it, then use the trash button to remove that step; selecting the action
+heading instead targets the whole action. Step deletion also works during recording
+and does not undo the document edit. The control equivalent is
+`actions.delete {"action": "Name", "step": 0}` (zero-based). Omitting `step` deletes
+the whole action, which still requires recording to be stopped.
 
 Desktop actions also record and replay View › Fit on Screen (`view.fitOnScreen`),
 100% (`view.actualPixels`), Zoom In and Zoom Out through their menu commands or shortcuts.
@@ -404,10 +411,3 @@ and region changes rebuild only the dependent analysis. Display options and the 
 geometry persist in preferences `dialogs["filter.cameraRaw.scope"]`; probes and vectorscope
 visibility reset when the dialog opens. HDR scopes are not implemented. See
 [camera-raw-histogram.md](camera-raw-histogram.md).
-
-The Actions panel shows replayable steps immediately while recording. Click an individual
-step to select it, then use the trash button to remove that step; selecting the action
-heading instead targets the whole action. Step deletion also works during recording
-and does not undo the document edit. The control equivalent is
-`actions.delete {"action": "Name", "step": 0}` (zero-based). Omitting `step` deletes
-the whole action, which still requires recording to be stopped.
