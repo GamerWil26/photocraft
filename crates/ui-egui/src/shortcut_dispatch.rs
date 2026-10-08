@@ -50,6 +50,8 @@ pub const SECONDARY: &[(&str, &str)] = &[("edit.fill", "Shift+Backspace")];
 /// their overrides apply. Held temporary tools (Space…) are not here: see [`crate::hold_keys`].
 pub fn bindings(app: &PhotocraftApp) -> Vec<(String, KeyboardShortcut)> {
     let prefs = app.session.prefs();
+    let action_ids: Vec<String> = app.session.actions.list.iter().map(|a| crate::actions::shortcut_id(&a.name)).collect();
+    let actions = action_ids.iter().map(|id| (id.as_str(), prefs.shortcut(id, None)));
     let ui = crate::menus::UI_COMMANDS.iter().map(|(id, _, _, sc)| (*id, prefs.shortcut(id, *sc)));
     let engine = photocraft_engine::command_specs().iter().map(|c| (c.id, prefs.shortcut(c.id, c.shortcut)));
     let own: std::collections::HashSet<&str> = crate::menus::UI_COMMANDS
@@ -66,6 +68,7 @@ pub fn bindings(app: &PhotocraftApp) -> Vec<(String, KeyboardShortcut)> {
         .iter()
         .filter(|(id, sc)| {
             !sc.is_empty()
+                && !id.starts_with(crate::actions::SHORTCUT_PREFIX)
                 && photocraft_engine::commands::find(id).is_none()
                 && !crate::menus::UI_COMMANDS.iter().any(|c| c.0 == id.as_str())
                 && !crate::hold_keys::is_temporary(id)
@@ -74,7 +77,7 @@ pub fn bindings(app: &PhotocraftApp) -> Vec<(String, KeyboardShortcut)> {
     // Photoshop's second shortcuts, kept while the command's main one is the default.
     let secondary = SECONDARY.iter().filter(|(id, _)| !prefs.shortcuts.contains_key(*id)).map(|&(id, sc)| (id, Some(sc)));
     let mut all: Vec<(String, KeyboardShortcut)> = Vec::new();
-    for (id, sc) in ui.chain(engine).chain(catalog).chain(overrides).chain(secondary) {
+    for (id, sc) in actions.chain(ui).chain(engine).chain(catalog).chain(overrides).chain(secondary) {
         let Some(sc) = sc.and_then(parse) else { continue };
         if !all.iter().any(|(_, b)| *b == sc) {
             all.push((id.to_string(), sc));
@@ -224,15 +227,24 @@ fn label(id: &str) -> String {
 
 /// Run a shortcut's command like its menu item (dialogs included), or say why it can't run.
 pub fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str) {
-    let outcome = if !crate::menus::is_enabled(app, id) {
-        let why = disabled_reason(app, id);
+    let action = id.strip_prefix(crate::actions::SHORTCUT_PREFIX);
+    let command_id = if action.is_some() { "actions.play" } else { id };
+    let outcome = if !crate::menus::is_enabled(app, command_id) {
+        let why = disabled_reason(app, command_id);
         app.ui.status = format!("{} is not available: {why}", label(id));
         app.ui.status_error = true;
         Outcome::Disabled(why)
     } else if ctx.data(|d| d.get_temp::<bool>(dry_run_id())).unwrap_or(false) {
         Outcome::Ran
     } else {
-        let r = if crate::adjust_dialog::has_dialog(id) {
+        let r = if let Some(name) = action {
+            // Use the normal command path: synthetic input and every nested action
+            // step must still pass the automation authorizer.
+            crate::menus::invoke(app, ctx, "actions.play", json!({"action": name})).and_then(|v| {
+                crate::actions::report_play(app, &v);
+                if v.get("failed").is_some_and(|f| f.is_object()) { Err(app.ui.status.clone()) } else { Ok(v) }
+            })
+        } else if crate::adjust_dialog::has_dialog(id) {
             crate::adjust_dialog::open(app, id);
             Ok(serde_json::Value::Null)
         } else {

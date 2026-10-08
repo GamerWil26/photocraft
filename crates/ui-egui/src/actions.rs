@@ -38,6 +38,28 @@ pub fn action_steps(action: &Action) -> Vec<Value> {
     action.steps.iter().map(|(id, p)| json!([id, p])).collect()
 }
 
+/// Named action bindings use the existing persisted shortcut overrides. Keeping the
+/// name in the key means selecting or deleting another row cannot retarget F6.
+pub(crate) const SHORTCUT_PREFIX: &str = "actions.play:";
+
+pub(crate) fn shortcut_id(name: &str) -> String {
+    format!("{SHORTCUT_PREFIX}{name}")
+}
+
+pub(crate) fn assign_shortcut(app: &mut PhotocraftApp, name: &str, shortcut: &str) -> Result<Value, String> {
+    let id = shortcut_id(name);
+    let mut set = serde_json::Map::new();
+    // A function key belongs to only one action. Ordinary menu bindings remain
+    // intact and become available again when the action binding is removed.
+    for (other, assigned) in &app.session.prefs().shortcuts {
+        if other.starts_with(SHORTCUT_PREFIX) && other != &id && assigned == shortcut && !shortcut.is_empty() {
+            set.insert(other.clone(), json!(""));
+        }
+    }
+    set.insert(id, json!(shortcut));
+    app.run("edit.keyboardShortcuts", json!({"set": set, "allowUnknown": true, "removeConflicts": false}))
+}
+
 fn begin_recording(app: &mut PhotocraftApp) {
     if app.session.actions.recording.is_some() {
         return;
@@ -51,10 +73,11 @@ fn begin_recording(app: &mut PhotocraftApp) {
     app.ui.actions.expanded[i] = true;
 }
 
-fn report_play(app: &mut PhotocraftApp, v: &Value) {
+pub(crate) fn report_play(app: &mut PhotocraftApp, v: &Value) {
     let Some(failed) = v.get("failed").filter(|f| f.is_object()) else {
         let ran = v.get("ran").and_then(Value::as_u64).unwrap_or(0);
         app.ui.status = format!("Played {ran} steps");
+        app.ui.status_error = false;
         return;
     };
     let step = failed.get("step").and_then(Value::as_u64).unwrap_or(0);
@@ -102,7 +125,12 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.painter().text(
                 pos2(rect.right() - 8.0, rect.center().y),
                 Align2::RIGHT_CENTER,
-                format!("{nsteps} steps"),
+                app.session
+                    .prefs()
+                    .shortcuts
+                    .get(&shortcut_id(name))
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| format!("{nsteps} steps"), |key| format!("{key} · {nsteps} steps")),
                 egui::FontId::proportional(11.0),
                 t.text_faint,
             );
@@ -118,6 +146,17 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     app.ui.actions.expanded[i] = !expanded;
                 }
             }
+            resp.context_menu(|ui| {
+                ui.label(tl!("Function key"));
+                let current = app.session.prefs().shortcuts.get(&shortcut_id(name)).cloned().unwrap_or_default();
+                for key in std::iter::once(String::new()).chain((1..=12).map(|n| format!("F{n}"))) {
+                    let label = if key.is_empty() { tl!("None").to_string() } else { key.clone() };
+                    if ui.selectable_label(current == key, label).clicked() {
+                        let _ = assign_shortcut(app, name, &key);
+                        ui.close();
+                    }
+                }
+            });
             if resp.double_clicked() {
                 play_idx = Some(i);
             }
