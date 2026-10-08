@@ -3,7 +3,7 @@
 //!
 //! The list lives on [`Session`] so the panel, the CLI, the control channel and MCP share one
 //! copy. Recording copies replayable journal entries (commands whose [`CommandSpec::journal`] is
-//! set, except `actions.*`) into an action. Playback runs those steps with [`Session::execute`]
+//! set, except action-editing commands) into an action. Playback runs those steps with [`Session::execute`]
 //! and stops at the first error, leaving one history step per step that ran.
 //!
 //! An untrusted session installs [`Session::authorize`]. `actions.play` calls it for every nested
@@ -44,9 +44,12 @@ pub struct ActionState {
     /// Journal length when recording started, and the action index being recorded into.
     #[serde(skip)]
     pub recording: Option<(usize, usize)>,
-    /// Nesting depth of `actions.play`. Greater than zero refuses another play.
+    /// Nesting depth of `actions.play`, bounded by the playback stack limit.
     #[serde(skip)]
     pub playing: u8,
+    /// Active action names, for cycle detection in engine and desktop playback.
+    #[serde(skip)]
+    pub playback_stack: Vec<String>,
     /// Bumped whenever `list` changes, so the preset store can skip unchanged writes.
     #[serde(skip)]
     pub rev: u64,
@@ -58,10 +61,9 @@ impl ActionState {
     }
 }
 
-/// A journal entry worth replaying: the command records itself, and it is not an `actions.*`
-/// command (those would nest recording and playback).
+/// Replay commands and named action calls, excluding edits to the action definitions.
 pub fn replayable(id: &str) -> bool {
-    !id.starts_with("actions.") && (shell_view_command(id) || crate::commands::find(id).is_some_and(|c| c.journal))
+    id == "actions.play" || (!id.starts_with("actions.") && (shell_view_command(id) || crate::commands::find(id).is_some_and(|c| c.journal)))
 }
 
 /// View-only menu commands recorded by the desktop shell. Headless playback reports
@@ -72,11 +74,17 @@ pub fn shell_view_command(id: &str) -> bool {
 
 /// Shared validation for headless and shell playback. Does not start playback.
 pub fn playback_plan(s: &Session, p: &Value) -> Result<(Action, usize)> {
-    if s.actions.playing > 0 {
+    if s.actions.playing > 0 && s.actions.playback_stack.is_empty() {
         return Err(bad("actions.play", "an action is already playing"));
     }
     let idx = resolve(&s.actions.list, p, "actions.play")?;
     let action = s.actions.list.get(idx).cloned().ok_or_else(|| bad("actions.play", "no such action"))?;
+    if s.actions.playback_stack.iter().any(|name| name == &action.name) || s.actions.recording.is_some_and(|(_, i)| i == idx) {
+        return Err(bad("actions.play", format!("recursive action call to `{}`", action.name)));
+    }
+    if s.actions.playback_stack.len() >= 16 {
+        return Err(bad("actions.play", "action nesting exceeds 16 levels"));
+    }
     let from = from_step(p, action.steps.len())?;
     Ok((action, from))
 }
@@ -146,6 +154,7 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn record(s: &mut Session, p: &Value) -> Result<Value> {
+    not_playing(s, "actions.record")?;
     if s.actions.recording.is_some() {
         return Err(bad("actions.record", "already recording; stop first"));
     }
@@ -153,11 +162,20 @@ fn record(s: &mut Session, p: &Value) -> Result<Value> {
         resolve(&s.actions.list, p, "actions.record")?
     } else {
         let name = match p.get("name") {
-            None | Some(Value::Null) => format!("Action {}", s.actions.list.len() + 1),
+            None | Some(Value::Null) => {
+                let mut n = s.actions.list.len().saturating_add(1);
+                while s.actions.list.iter().any(|a| a.name == format!("Action {n}")) {
+                    n = n.checked_add(1).ok_or_else(|| bad("actions.record", "cannot allocate a unique action name"))?;
+                }
+                format!("Action {n}")
+            }
             Some(Value::String(n)) if !n.is_empty() => n.clone(),
             Some(Value::String(_)) => return Err(bad("actions.record", "\"name\" is empty")),
             Some(_) => return Err(bad("actions.record", "\"name\" must be a string")),
         };
+        if s.actions.list.iter().any(|action| action.name == name) {
+            return Err(bad("actions.record", "an action with this name already exists"));
+        }
         s.actions.list.push(Action { name, steps: Vec::new() });
         s.actions.touch();
         s.actions.list.len() - 1
@@ -188,6 +206,7 @@ fn flush_recording(s: &mut Session) -> Result<()> {
 }
 
 fn stop(s: &mut Session, _p: &Value) -> Result<Value> {
+    not_playing(s, "actions.stop")?;
     let Some((_, idx)) = s.actions.recording else {
         return Err(bad("actions.stop", "not recording"));
     };
@@ -208,7 +227,13 @@ fn run_recorded(s: &mut Session, steps: &[(String, Value)], from: usize) -> (u64
             break;
         }
         match s.execute(id, params.clone()) {
-            Ok(_) => ran += 1,
+            Ok(value) => {
+                if let Some(error) = nested_failure(id, &value) {
+                    failed = Some(json!({"step": i, "id": id, "error": error}));
+                    break;
+                }
+                ran += 1;
+            }
             Err(e) => {
                 failed = Some(json!({"step": i, "id": id, "error": e.to_string()}));
                 break;
@@ -218,18 +243,113 @@ fn run_recorded(s: &mut Session, steps: &[(String, Value)], from: usize) -> (u64
     (ran, failed)
 }
 
+/// Suspend recording while a called action executes. Keep its commands in the journal
+/// for diagnostics, but record just the named call in the parent action.
+pub fn begin_playback(s: &mut Session, action: &Action) -> Result<Option<(usize, usize)>> {
+    flush_recording(s)?;
+    let recording = s.actions.recording.take();
+    s.actions.playing = s.actions.playing.saturating_add(1);
+    s.actions.playback_stack.push(action.name.clone());
+    Ok(recording)
+}
+
+pub fn finish_playback(s: &mut Session, recording: Option<(usize, usize)>, action: &Action, from: usize) {
+    s.actions.playback_stack.pop();
+    s.actions.playing = s.actions.playing.saturating_sub(1);
+    if let Some((_, idx)) = recording {
+        s.actions.recording = Some((s.journal.len(), idx));
+        let mut params = json!({"action": action.name});
+        if from > 0 {
+            params["from"] = json!(from);
+        }
+        s.journal.push(("actions.play".into(), params));
+    }
+}
+
+/// Nested playback returns a structured failure even though the command itself succeeded.
+/// Promote it to the caller's failed step so no later parent steps run after a child fails.
+pub fn nested_failure(id: &str, value: &Value) -> Option<String> {
+    (id == "actions.play").then(|| value.get("failed")).flatten().map(|failure| {
+        format!(
+            "action `{}` step {} failed: {}",
+            value.get("action").and_then(Value::as_str).unwrap_or(""),
+            failure.get("step").and_then(Value::as_u64).unwrap_or(0).saturating_add(1),
+            failure.get("error").and_then(Value::as_str).unwrap_or("unknown error")
+        )
+    })
+}
+
 fn play(s: &mut Session, p: &Value) -> Result<Value> {
     let (action, from) = playback_plan(s, p)?;
-    s.actions.playing = s.actions.playing.saturating_add(1);
+    let recording = begin_playback(s, &action)?;
     let (ran, failed) = run_recorded(s, &action.steps, from);
-    s.actions.playing = s.actions.playing.saturating_sub(1);
+    finish_playback(s, recording, &action, from);
     Ok(match failed {
         Some(f) => json!({"action": action.name, "ran": ran, "failed": f}),
         None => json!({"action": action.name, "ran": ran}),
     })
 }
 
+fn not_playing(s: &Session, cmd: &str) -> Result<()> {
+    if s.actions.playing > 0 { Err(bad(cmd, "cannot edit actions during playback")) } else { Ok(()) }
+}
+
+/// Move to a final zero-based index, either in an action's steps or in the action list.
+fn move_item(s: &mut Session, p: &Value) -> Result<Value> {
+    not_playing(s, "actions.move")?;
+    let idx = resolve(&s.actions.list, p, "actions.move")?;
+    let index = |key: &str| -> Result<usize> {
+        p.get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| bad("actions.move", format!("{key} must be a non-negative integer")))
+    };
+    let to = index("to")?;
+    if p.get("step").is_some() {
+        let step = index("step")?;
+        let len = s.actions.list[idx].steps.len().saturating_add(pending_steps(s, idx).count());
+        if step >= len || to >= len {
+            return Err(bad("actions.move", "step or destination is out of range"));
+        }
+        if s.actions.recording.is_some_and(|(_, i)| i == idx) {
+            flush_recording(s)?;
+        }
+        let action = &mut s.actions.list[idx];
+        let moved = action.steps.remove(step);
+        action.steps.insert(to, moved);
+        let result = json!({"action": action.name, "step": to});
+        s.actions.touch();
+        Ok(result)
+    } else {
+        if to >= s.actions.list.len() {
+            return Err(bad("actions.move", "destination is out of range"));
+        }
+        let moved = s.actions.list.remove(idx);
+        let result = json!({"action": moved.name, "index": to});
+        s.actions.list.insert(to, moved);
+        if let Some((_, recording)) = s.actions.recording.as_mut() {
+            *recording = moved_index(*recording, idx, to);
+        }
+        s.actions.touch();
+        Ok(result)
+    }
+}
+
+/// Follow a selected/recording row when a list item is moved.
+pub fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {
+    not_playing(s, "actions.delete")?;
     let idx = resolve(&s.actions.list, p, "actions.delete")?;
     if let Some(step) = p.get("step") {
         let step = step.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad("actions.delete", "step must be a non-negative integer"))?;
@@ -258,6 +378,16 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        CommandSpec {
+            id: "actions.move",
+            label: "Move Action or Step",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"action":name|index, "step":index?, "to":index}. Move a step within its action, or the action itself. to is the final zero-based index. Pending recorded steps can be moved."##,
+            enabled: always,
+            run: move_item,
+            journal: false,
+        },
         CommandSpec {
             id: "actions.list",
             label: "List Actions",
@@ -293,7 +423,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Stop Recording",
             menu: &[],
             shortcut: None,
-            params: "{} → {action, steps:count} (steps recorded since actions.record, queries and actions.* omitted)",
+            params: "{} → {action, steps:count} (steps recorded since actions.record, queries and action-editing commands omitted)",
             enabled: always,
             run: stop,
             journal: false,
@@ -303,7 +433,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Play Action",
             menu: &[],
             shortcut: None,
-            params: r##"{"action":name|index, "from":step?} → {action, ran, failed?:{step, id, error}}. step and from are 0-based. Stops at the first error (the command still returns ok, with failed set) and leaves one history step per step that ran. Refuses to play while a play is already running. Each step is checked with Session::authorize when one is installed."##,
+            params: r##"{"action":name|index, "from":step?} → {action, ran, failed?:{step, id, error}}. step and from are 0-based. Stops at the first error (the command still returns ok, with failed set) and leaves one history step per step that ran. Nested calls are supported up to 16 levels; cycles are rejected. Recording stores a named call rather than its expanded commands. Each step is checked with Session::authorize when one is installed."##,
             enabled: always,
             run: play,
             journal: false,
@@ -399,7 +529,7 @@ mod tests {
         let r = s.execute("actions.play", json!({"action": "Loop"})).unwrap();
         assert_eq!(r["ran"], 0);
         assert_eq!(r["failed"]["id"], "actions.play");
-        assert!(r["failed"]["error"].as_str().unwrap().contains("already playing"), "{r}");
+        assert!(r["failed"]["error"].as_str().unwrap().contains("recursive action"), "{r}");
         assert_eq!(s.actions.playing, 0);
     }
 
@@ -482,6 +612,122 @@ mod tests {
     }
 
     #[test]
+    fn nested_call_records_one_named_step_and_tracks_child_edits() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 4, "height": 4})).unwrap();
+        s.actions.list.push(Action { name: "Child".into(), steps: vec![("layer.new.layer".into(), json!({"name": "Child layer"}))] });
+        s.execute("actions.record", json!({"name": "Parent"})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Before"})).unwrap();
+        s.execute("actions.play", json!({"action": 0})).unwrap();
+        assert_eq!(pending_steps(&s, 1).cloned().collect::<Vec<_>>(), [("actions.play".into(), json!({"action": "Child"}))]);
+        s.execute("layer.new.layer", json!({"name": "After"})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        assert_eq!(s.actions.list[1].steps.iter().map(|st| st.0.as_str()).collect::<Vec<_>>(), ["layer.new.layer", "actions.play", "layer.new.layer"]);
+        s.actions.list[0].steps.push(("layer.new.layer".into(), json!({"name": "Added later"})));
+        s.execute("actions.move", json!({"action": "Child", "to": 1})).unwrap();
+        let saved = serde_json::to_string(&s.actions.list).unwrap();
+        s.actions.list = serde_json::from_str(&saved).unwrap();
+        s.execute("file.new", json!({"width": 4, "height": 4})).unwrap();
+        let result = s.execute("actions.play", json!({"action": "Parent"})).unwrap();
+        assert!(result.get("failed").is_none(), "{result}");
+        assert_eq!(
+            s.active().unwrap().doc.layers.iter().skip(1).map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["Before", "Child layer", "Added later", "After"]
+        );
+        assert!(s.actions.playback_stack.is_empty());
+    }
+
+    #[test]
+    fn nested_failure_cycles_depth_and_authorization_stop_parent() {
+        let mut s = Session::new();
+        s.actions.list.push(Action {
+            name: "A".into(),
+            steps: vec![("actions.play".into(), json!({"action": "B"})), ("file.new".into(), json!({"width": 2,"height": 2}))],
+        });
+        s.actions.list.push(Action { name: "B".into(), steps: vec![("actions.play".into(), json!({"action": "A"}))] });
+        let r = s.execute("actions.play", json!({"action": "A"})).unwrap();
+        assert!(r["failed"]["error"].as_str().unwrap().contains("recursive"));
+        assert!(s.documents().is_empty());
+        s.actions.list[1].steps = vec![("file.new".into(), json!({"width": 2,"height": 2}))];
+        s.authorize = Some(|id, _| if id == "file.new" { Err(EngineError::Other("denied nested file".into())) } else { Ok(()) });
+        let r = s.execute("actions.play", json!({"action": "A"})).unwrap();
+        assert!(r["failed"]["error"].as_str().unwrap().contains("denied nested file"));
+        assert!(s.documents().is_empty());
+        s.authorize = None;
+        s.actions.list.clear();
+        for i in 0..17 {
+            s.actions.list.push(Action {
+                name: format!("N{i}"),
+                steps: if i < 16 { vec![("actions.play".into(), json!({"action":format!("N{}", i + 1)}))] } else { vec![] },
+            });
+        }
+        let r = s.execute("actions.play", json!({"action": "N0"})).unwrap();
+        assert!(r["failed"]["error"].as_str().unwrap().contains("16 levels"));
+        assert_eq!(s.actions.playing, 0);
+        assert!(s.actions.playback_stack.is_empty());
+        s.actions.list[15].steps.clear();
+        assert!(s.execute("actions.play", json!({"action": "N0"})).unwrap().get("failed").is_none());
+    }
+
+    #[test]
+    fn move_pending_steps_is_atomic_persists_and_changes_playback_order() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 4, "height": 4})).unwrap();
+        s.execute("actions.record", json!({"name": "Order"})).unwrap();
+        for name in ["One", "Two", "Three"] {
+            s.execute("layer.new.layer", json!({"name": name})).unwrap();
+        }
+        let before = s.actions.clone();
+        for params in [
+            json!({"action":0,"step":0,"to":3}),
+            json!({"action":0,"step":99,"to":0}),
+            json!({"action":0,"step":0.5,"to":0}),
+            json!({"action":0,"to":-1}),
+            json!({"action":0,"to":null}),
+        ] {
+            assert!(s.execute("actions.move", params).is_err());
+            assert_eq!(s.actions, before);
+        }
+        let journal = s.journal.clone();
+        s.execute("actions.move", json!({"action":0,"step":0,"to":2})).unwrap();
+        s.execute("actions.move", json!({"action":0,"step":1,"to":0})).unwrap();
+        assert_eq!(s.journal, journal);
+        s.execute("layer.new.layer", json!({"name":"Four"})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        assert_eq!(s.actions.list[0].steps.iter().map(|st| st.1["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Three", "Two", "One", "Four"]);
+        s.execute("file.new", json!({"width":4,"height":4})).unwrap();
+        s.execute("actions.play", json!({"action":0})).unwrap();
+        assert_eq!(s.active().unwrap().doc.layers.iter().skip(1).map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Three", "Two", "One", "Four"]);
+    }
+
+    #[test]
+    fn new_names_do_not_collide_with_named_calls() {
+        let mut s = Session::new();
+        s.actions.list.push(Action { name: "Action 2".into(), steps: vec![] });
+        assert_eq!(s.execute("actions.record", json!({})).unwrap()["action"], "Action 3");
+        s.execute("actions.stop", json!({})).unwrap();
+        assert!(s.execute("actions.record", json!({"name":"Action 2"})).is_err());
+        assert!(s.actions.recording.is_none());
+    }
+
+    #[test]
+    fn moving_action_keeps_recording_attached_to_it() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":4,"height":4})).unwrap();
+        for name in ["A", "B", "C"] {
+            s.actions.list.push(Action { name: name.into(), steps: vec![] });
+        }
+        s.execute("actions.record", json!({"action":"B"})).unwrap();
+        s.execute("layer.new.layer", json!({"name":"before"})).unwrap();
+        s.execute("actions.move", json!({"action":"B","to":2})).unwrap();
+        s.execute("actions.move", json!({"action":"A","to":2})).unwrap();
+        s.execute("layer.new.layer", json!({"name":"after"})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        assert_eq!(s.actions.list[1].name, "B");
+        assert_eq!(s.actions.list[1].steps.len(), 2);
+    }
+
+    #[test]
     fn bad_params_do_not_panic() {
         let mut s = Session::new();
         let junk = [
@@ -499,7 +745,7 @@ mod tests {
             json!({"from": -3}),
             json!({"action": "missing", "from": 4}),
         ];
-        for id in ["actions.list", "actions.get", "actions.record", "actions.stop", "actions.play", "actions.delete"] {
+        for id in ["actions.list", "actions.get", "actions.record", "actions.stop", "actions.play", "actions.delete", "actions.move"] {
             for p in &junk {
                 let _ = s.execute(id, p.clone());
             }

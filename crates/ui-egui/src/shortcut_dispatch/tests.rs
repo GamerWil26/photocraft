@@ -472,3 +472,18 @@ fn fit_shortcut_records_and_f6_fits_the_resized_canvas() {
     assert_eq!(view.center, [900.0, 540.0]);
     assert_eq!(h.state().ui.status, "Played 2 steps");
 }
+
+#[test]
+fn f6_while_recording_records_a_named_call_not_the_child_steps() {
+    let mut h = harness();
+    h.state_mut().session.actions.list.push(photocraft_engine::actions_cmds::Action {
+        name: "LivePrint 2R".into(),
+        steps: vec![("layer.new.layer".into(), json!({"name":"Nested overlay"})), ("view.fitOnScreen".into(), json!({}))],
+    });
+    crate::actions::assign_shortcut(h.state_mut(), "LivePrint 2R", "F6").unwrap();
+    h.state_mut().run("actions.record", json!({"name":"Action 2"})).unwrap();
+    press(&mut h, "F6");
+    assert_eq!(active_name(&h), "Nested overlay");
+    h.state_mut().run("actions.stop", json!({})).unwrap();
+    assert_eq!(h.state().session.actions.list[1].steps, [("actions.play".into(), json!({"action":"LivePrint 2R"}))]);
+}

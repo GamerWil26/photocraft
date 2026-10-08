@@ -86,8 +86,16 @@ store expose and persist the same setting; scripts keep using canonical command 
 | `actions.get` | `{"action": name or index}` → `{name, steps:[[id, params], …]}`, the shape `file.automate.batch` and droplets take |
 | `actions.record` | `{"name":"Red"}` starts a new action (default name `Action N`). `{"action": name or index}` appends to one that exists |
 | `actions.stop` | `{}` → `{action, steps}`. Copies replayable journal entries since `actions.record` (queries and `actions.*` omitted) |
-| `actions.play` | `{"action": name or index, "from": step?}`. `from` and `failed.step` are 0-based. Returns `{action, ran, failed?:{step, id, error}}` and still returns ok when a step fails, so a partial run is reported. Leaves one history step per step that ran. Refuses to play while a play is already running. On an untrusted session each step is authorized the same way as a top-level command |
-| `actions.delete` | `{"action": name or index}` → `{deleted}`. Refused while recording |
+| `actions.play` | `{"action": name or index, "from": step?}`. `from` and `failed.step` are 0-based. Returns `{action, ran, failed?:{step, id, error}}` and still returns ok when a step fails, so a partial run is reported. Leaves one history step per step that ran. Supports nested action calls up to 16 levels, rejecting cycles. While recording, playing another action appends one named `actions.play` step instead of its expanded commands. On an untrusted session each step is authorized the same way as a top-level command |
+| `actions.move` | `{"action": name or index, "step": index?, "to": index}` moves a step within its action, or moves the whole action when `step` is omitted. `to` is the final zero-based index. Pending steps can be reordered while recording; invalid moves leave the list unchanged. |
+| `actions.delete` | `{"action": name or index, "step": index?}`. With a zero-based `step`: `{action, deletedStep, steps}`, also allowed while recording. Without `step`: `{deleted}`, refused while recording |
+
+The Actions panel shows replayable steps immediately while recording. Click an individual
+step to select it, then use the trash button to remove that step; selecting the action
+heading instead targets the whole action. Step deletion also works during recording
+and does not undo the document edit. The control equivalent is
+`actions.delete {"action": "Name", "step": 0}` (zero-based). Omitting `step` deletes
+the whole action, which still requires recording to be stopped.
 
 Desktop actions also record and replay View › Fit on Screen (`view.fitOnScreen`),
 100% (`view.actualPixels`), Zoom In and Zoom Out through their menu commands or shortcuts.
@@ -405,9 +413,18 @@ geometry persist in preferences `dialogs["filter.cameraRaw.scope"]`; probes and 
 visibility reset when the dialog opens. HDR scopes are not implemented. See
 [camera-raw-histogram.md](camera-raw-histogram.md).
 
-The Actions panel shows replayable steps immediately while recording. Click an individual
-step to select it, then use the trash button to remove that step; selecting the action
-heading instead targets the whole action. Step deletion also works during recording
-and does not undo the document edit. The control equivalent is
-`actions.delete {"action": "Name", "step": 0}` (zero-based). Omitting `step` deletes
-the whole action, which still requires recording to be stopped.
+### Editing and composing actions
+
+Creating an action scrolls its row into view; newly recorded steps are revealed immediately.
+Drag a step above or below another step in the same action to reorder it. Drag an action header
+to reorder the action list. The insertion line marks the drop position; dragging near the rows'
+top or bottom scrolls the list. Reordering is saved with the actions and does not undo image edits.
+
+While recording, press a function key assigned to another action (or play it from the panel).
+The recorder adds **Play Action: <name>** as one step, and the called action still executes.
+Playback resolves the name each time, so editing or moving the called action does not freeze or
+retarget the caller. Reassigning F6 later does not change an already recorded named call.
+Missing actions, recursive calls and nesting beyond 16 levels fail visibly; a child failure stops
+the parent before its next step. Every nested command retains the normal automation permission check.
+Existing recordings containing expanded commands remain unchanged; remove those steps and record
+the named call again if desired.

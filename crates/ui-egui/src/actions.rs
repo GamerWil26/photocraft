@@ -1,7 +1,7 @@
 //! Actions panel: record and replay command sequences.
 //!
 //! The list and the recording flag live on the engine session (`actions.record` / `stop` /
-//! `play` / `list` / `get` / `delete`), so the panel, the CLI and MCP share them. This module
+//! `play` / `list` / `get` / `delete` / `move`), so the panel, the CLI and MCP share them. This module
 //! keeps only which row is selected and which rows are expanded.
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
@@ -21,6 +21,8 @@ pub struct ActionsUi {
     pub selected: Option<usize>,
     pub selected_step: Option<usize>,
     pub expanded: Vec<bool>,
+    #[serde(skip)]
+    reveal_recording: Option<(usize, usize)>,
 }
 
 fn label_of(id: &str) -> String {
@@ -69,7 +71,7 @@ pub(crate) fn assign_shortcut(app: &mut PhotocraftApp, name: &str, shortcut: &st
 /// Engine steps keep the headless action semantics (no dialogs or background jobs).
 pub(crate) fn play(app: &mut PhotocraftApp, params: &Value) -> Result<Value, String> {
     let (action, from) = actions_cmds::playback_plan(&app.session, params).map_err(|e| e.to_string())?;
-    app.session.actions.playing += 1;
+    let recording = actions_cmds::begin_playback(&mut app.session, &action).map_err(|e| e.to_string())?;
     let mut ran = 0u64;
     let mut failed = None;
     for (i, (id, p)) in action.steps.iter().enumerate().skip(from) {
@@ -77,7 +79,9 @@ pub(crate) fn play(app: &mut PhotocraftApp, params: &Value) -> Result<Value, Str
             if let Some(auth) = app.session.authorize {
                 auth(id, p).map_err(|e| e.to_string())?;
             }
-            if actions_cmds::shell_view_command(id) {
+            if id == "actions.play" {
+                play(app, p)
+            } else if actions_cmds::shell_view_command(id) {
                 app.sync_views();
                 app.run(id, p.clone())
             } else {
@@ -85,14 +89,20 @@ pub(crate) fn play(app: &mut PhotocraftApp, params: &Value) -> Result<Value, Str
             }
         })();
         match result {
-            Ok(_) => ran += 1,
+            Ok(value) => {
+                if let Some(error) = actions_cmds::nested_failure(id, &value) {
+                    failed = Some(json!({"step": i, "id": id, "error": error}));
+                    break;
+                }
+                ran += 1;
+            }
             Err(error) => {
                 failed = Some(json!({"step": i, "id": id, "error": error}));
                 break;
             }
         }
     }
-    app.session.actions.playing -= 1;
+    actions_cmds::finish_playback(&mut app.session, recording, &action, from);
     Ok(match failed {
         Some(f) => json!({"action": action.name, "ran": ran, "failed": f}),
         None => json!({"action": action.name, "ran": ran}),
@@ -154,16 +164,62 @@ pub(crate) fn report_play(app: &mut PhotocraftApp, v: &Value) {
     app.ui.status_error = true;
 }
 
-fn visible_steps(app: &PhotocraftApp, action: usize) -> Vec<String> {
-    app.session
-        .actions
-        .list
-        .get(action)
-        .into_iter()
-        .flat_map(|a| a.steps.iter())
-        .chain(actions_cmds::pending_steps(&app.session, action))
-        .map(|(id, _)| id.clone())
-        .collect()
+fn visible_steps(app: &PhotocraftApp, action: usize) -> Vec<(String, Value)> {
+    app.session.actions.list.get(action).into_iter().flat_map(|a| a.steps.iter()).chain(actions_cmds::pending_steps(&app.session, action)).cloned().collect()
+}
+
+fn step_label(id: &str, params: &Value) -> String {
+    if id == "actions.play" {
+        let target = params.get("action").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+        format!("{}: {target}", label_of(id))
+    } else {
+        label_of(id)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DragRow {
+    action: usize,
+    step: Option<usize>,
+}
+
+/// Drops use an insertion line, converted to the final index expected by actions.move.
+fn drag_row(ui: &egui::Ui, response: &egui::Response, row: DragRow, t: &Tokens) -> Option<(DragRow, usize)> {
+    response.dnd_set_drag_payload(row);
+    let source = response.dnd_hover_payload::<DragRow>()?;
+    if source.step.is_some() != row.step.is_some() || (source.step.is_some() && source.action != row.action) {
+        return None;
+    }
+    let after = ui.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y >= response.rect.center().y));
+    let index = row.step.unwrap_or(row.action);
+    let from = source.step.unwrap_or(source.action);
+    let slot = index.saturating_add(usize::from(after));
+    let to = if from < slot { slot.saturating_sub(1) } else { slot };
+    let y = if after { response.rect.bottom() } else { response.rect.top() };
+    ui.painter().line_segment([pos2(response.rect.left() + 22.0, y), pos2(response.rect.right(), y)], Stroke::new(2.0, t.accent));
+    response.dnd_release_payload::<DragRow>().map(|source| (*source, to))
+}
+
+fn move_row(app: &mut PhotocraftApp, source: DragRow, to: usize) {
+    let mut params = json!({"action": source.action, "to": to});
+    if let Some(step) = source.step {
+        params["step"] = json!(step);
+    }
+    if app.run("actions.move", params).is_err() {
+        return;
+    }
+    if source.step.is_some() {
+        app.ui.actions.selected = Some(source.action);
+        app.ui.actions.selected_step = Some(to);
+    } else {
+        app.ui.actions.expanded.resize(app.session.actions.list.len(), false);
+        if source.action < app.ui.actions.expanded.len() && to < app.ui.actions.expanded.len() {
+            let expanded = app.ui.actions.expanded.remove(source.action);
+            app.ui.actions.expanded.insert(to, expanded);
+        }
+        app.ui.actions.selected = Some(to);
+        app.ui.actions.selected_step = None;
+    }
 }
 
 fn delete_selection(app: &mut PhotocraftApp) {
@@ -188,7 +244,7 @@ fn delete_selection(app: &mut PhotocraftApp) {
 pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let recording = app.session.actions.recording;
-    let rows: Vec<(String, Vec<String>)> = app.session.actions.list.iter().enumerate().map(|(i, a)| (a.name.clone(), visible_steps(app, i))).collect();
+    let rows: Vec<_> = app.session.actions.list.iter().enumerate().map(|(i, a)| (a.name.clone(), visible_steps(app, i))).collect();
     if app
         .ui
         .actions
@@ -203,17 +259,50 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
     let max_h = (ui.available_height() - 70.0).clamp(80.0, 320.0);
     let mut play_idx = None;
+    let mut moved = None;
+    let recording_row = recording.and_then(|(_, i)| rows.get(i).map(|(_, steps)| (i, steps.len())));
+    let reveal = recording_row.filter(|row| app.ui.actions.reveal_recording != Some(*row));
+    app.ui.actions.reveal_recording = recording_row;
+    if let Some((i, _)) = reveal {
+        app.ui.actions.expanded.resize(rows.len(), false);
+        if let Some(expanded) = app.ui.actions.expanded.get_mut(i) {
+            *expanded = true;
+        }
+    }
     egui::ScrollArea::vertical().id_salt("actions-rows").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
         if rows.is_empty() {
             ui.label(egui::RichText::new(tl!("Record ● a sequence of edits, then play ▶ it on any document.")).color(t.text_faint).size(11.5));
         }
+        if egui::DragAndDrop::has_payload_of_type::<DragRow>(ui.ctx()) {
+            let clip = ui.clip_rect();
+            if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p)) {
+                let delta = if p.y < clip.top() + 22.0 {
+                    8.0
+                } else if p.y > clip.bottom() - 22.0 {
+                    -8.0
+                } else {
+                    0.0
+                };
+                if delta != 0.0 {
+                    ui.scroll_with_delta(vec2(0.0, delta));
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
         for (i, (name, steps)) in rows.iter().enumerate() {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click_and_drag());
+            if reveal == Some((i, 0)) {
+                ui.scroll_to_rect(rect, Some(egui::Align::BOTTOM));
+            }
             let sel = app.ui.actions.selected == Some(i) && app.ui.actions.selected_step.is_none();
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, sel, name));
             if sel {
                 ui.painter().rect_filled(rect, 0.0, t.row_selected);
             } else if resp.hovered() {
                 ui.painter().rect_filled(rect, 0.0, t.hover.gamma_multiply(0.5));
+            }
+            if let Some(change) = drag_row(ui, &resp, DragRow { action: i, step: None }, &t) {
+                moved = Some(change);
             }
             let expanded = app.ui.actions.expanded.get(i).copied().unwrap_or(false);
             let tri = Rect::from_center_size(pos2(rect.left() + 12.0, rect.center().y), vec2(8.0, 8.0));
@@ -264,15 +353,21 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 play_idx = Some(i);
             }
             if expanded {
-                for (step, id) in steps.iter().enumerate() {
-                    let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
-                    let label = label_of(id);
+                for (step, (id, params)) in steps.iter().enumerate() {
+                    let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click_and_drag());
+                    if reveal == Some((i, step + 1)) {
+                        ui.scroll_to_rect(r, Some(egui::Align::BOTTOM));
+                    }
+                    let label = step_label(id, params);
                     let selected = app.ui.actions.selected == Some(i) && app.ui.actions.selected_step == Some(step);
                     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label));
                     if selected {
                         ui.painter().rect_filled(r, 0.0, t.row_selected);
                     } else if response.hovered() {
                         ui.painter().rect_filled(r, 0.0, t.hover.gamma_multiply(0.5));
+                    }
+                    if let Some(change) = drag_row(ui, &response, DragRow { action: i, step: Some(step) }, &t) {
+                        moved = Some(change);
                     }
                     ui.painter().text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, label, egui::FontId::proportional(11.5), t.text_dim);
                     if response.clicked() {
@@ -283,6 +378,9 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
         }
     });
+    if let Some((source, to)) = moved {
+        move_row(app, source, to);
+    }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -325,6 +423,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recording_reveals_new_action_and_latest_step_in_a_long_panel() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width":4,"height":4})).unwrap();
+        for i in 0..30 {
+            app.session.actions.list.push(Action { name: format!("Existing {i}"), steps: vec![] });
+        }
+        let mut h = Harness::builder().with_size(vec2(320.0, 260.0)).build_ui_state(|ui, app| panel(app, ui), app);
+        h.run_steps(4);
+        begin_recording(h.state_mut(), false);
+        h.run_steps(20);
+        let rect = h.get_by_label("Action 31").rect();
+        assert!(rect.top() >= 0.0 && rect.bottom() <= 205.0, "new action visible: {rect:?}");
+        for _ in 0..20 {
+            h.state_mut().run("view.zoomOut", json!({})).unwrap();
+        }
+        h.state_mut().run("view.fitOnScreen", json!({})).unwrap();
+        h.run_steps(20);
+        let rect = h.get_by_label("Fit on Screen").rect();
+        assert!(rect.top() >= 0.0 && rect.bottom() <= 205.0, "latest step visible: {rect:?}");
+    }
+
+    #[test]
+    fn drag_steps_and_action_headers_reorders_and_keeps_selection() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.actions.list.push(Action {
+            name: "First".into(),
+            steps: vec![("view.zoomOut".into(), json!({})), ("view.fitOnScreen".into(), json!({})), ("view.actualPixels".into(), json!({}))],
+        });
+        app.session.actions.list.push(Action { name: "Second".into(), steps: vec![] });
+        app.ui.actions.expanded = vec![true, false];
+        let mut h = Harness::builder().with_size(vec2(320.0, 400.0)).build_ui_state(|ui, app| panel(app, ui), app);
+        h.run_steps(4);
+        fn drag(h: &mut Harness<'_, PhotocraftApp>, from: egui::Pos2, to: egui::Pos2) {
+            h.event(egui::Event::PointerMoved(from));
+            h.run_steps(1);
+            h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+            h.run_steps(1);
+            h.event(egui::Event::PointerMoved(from + vec2(10.0, 0.0)));
+            h.run_steps(2);
+            h.event(egui::Event::PointerMoved(to));
+            h.run_steps(2);
+            h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+            h.run_steps(3);
+        }
+        let from = h.get_by_label("Zoom Out").rect().center();
+        let target = h.get_by_label("100%").rect();
+        drag(&mut h, from, pos2(target.center().x, target.bottom() - 2.0));
+        assert_eq!(
+            h.state().session.actions.list[0].steps.iter().map(|st| st.0.as_str()).collect::<Vec<_>>(),
+            ["view.fitOnScreen", "view.actualPixels", "view.zoomOut"]
+        );
+        assert_eq!(h.state().ui.actions.selected_step, Some(2));
+        let from = h.get_by_label("Second").rect().center();
+        let target = h.get_by_label("First").rect();
+        drag(&mut h, from, pos2(target.center().x, target.top() + 2.0));
+        assert_eq!(h.state().session.actions.list[0].name, "Second");
+        assert_eq!(h.state().ui.actions.expanded, [false, true]);
+        assert_eq!(h.state().ui.actions.selected, Some(0));
+    }
+
+    #[test]
+    fn nested_shell_actions_include_view_steps_and_propagate_failures() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width":40,"height":40})).unwrap();
+        app.session
+            .actions
+            .list
+            .push(Action { name: "Child".into(), steps: vec![("layer.new.layer".into(), json!({})), ("view.fitOnScreen".into(), json!({}))] });
+        app.run("actions.record", json!({"name":"Parent"})).unwrap();
+        app.run("actions.play", json!({"action":"Child"})).unwrap();
+        app.run("actions.stop", json!({})).unwrap();
+        assert_eq!(app.session.actions.list[1].steps, [("actions.play".into(), json!({"action":"Child"}))]);
+        assert_eq!(step_label("actions.play", &json!({"action":"Child"})), "Play Action: Child");
+        app.run("view.actualPixels", json!({})).unwrap();
+        let r = app.run("actions.play", json!({"action":"Parent"})).unwrap();
+        assert!(r.get("failed").is_none(), "{r}");
+        assert!(app.ui.views[0].fit_pending);
+        app.session.authorize =
+            Some(|id, _| if id == "view.fitOnScreen" { Err(photocraft_engine::EngineError::Other("denied nested view".into())) } else { Ok(()) });
+        let r = app.run("actions.play", json!({"action":"Parent"})).unwrap();
+        assert!(r["failed"]["error"].as_str().unwrap().contains("denied nested view"));
+        assert!(app.session.actions.playback_stack.is_empty());
+        assert_eq!(app.session.actions.playing, 0);
+    }
+
+    #[test]
     fn panel_shows_pending_steps_and_trash_deletes_only_the_clicked_step() {
         use egui_kittest::{Harness, kittest::Queryable};
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
@@ -341,7 +527,7 @@ mod tests {
         assert_eq!(h.state().ui.actions.selected_step, Some(1));
         h.get_by_label("Delete").click();
         h.run_steps(2);
-        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen"]);
+        assert_eq!(visible_steps(h.state(), 0).iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["view.fitOnScreen"]);
         assert_eq!(h.state().session.actions.list.len(), 1);
         assert!(h.state().session.actions.recording.is_some());
         assert!(h.state().ui.actions.selected.is_none());
@@ -352,12 +538,12 @@ mod tests {
         h.get_by_label("Zoom In");
         h.state_mut().run("actions.stop", json!({})).unwrap();
         h.run_steps(2);
-        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen", "view.zoomIn"]);
+        assert_eq!(visible_steps(h.state(), 0).iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["view.fitOnScreen", "view.zoomIn"]);
         h.get_by_label("Zoom In").click();
         h.run_steps(2);
         h.get_by_label("Delete").click();
         h.run_steps(2);
-        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen"]);
+        assert_eq!(visible_steps(h.state(), 0).iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["view.fitOnScreen"]);
     }
 
     #[test]
