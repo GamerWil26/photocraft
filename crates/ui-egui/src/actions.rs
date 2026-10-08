@@ -19,6 +19,7 @@ use crate::theme::Tokens;
 #[serde(default)]
 pub struct ActionsUi {
     pub selected: Option<usize>,
+    pub selected_step: Option<usize>,
     pub expanded: Vec<bool>,
 }
 
@@ -132,6 +133,7 @@ fn begin_recording(app: &mut PhotocraftApp, append: bool) {
     let Ok(v) = app.run("actions.record", params) else { return };
     let Some(i) = v.get("index").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()) else { return };
     app.ui.actions.selected = Some(i);
+    app.ui.actions.selected_step = None;
     if app.ui.actions.expanded.len() <= i {
         app.ui.actions.expanded.resize(i + 1, false);
     }
@@ -152,14 +154,49 @@ pub(crate) fn report_play(app: &mut PhotocraftApp, v: &Value) {
     app.ui.status_error = true;
 }
 
+fn visible_steps(app: &PhotocraftApp, action: usize) -> Vec<String> {
+    app.session
+        .actions
+        .list
+        .get(action)
+        .into_iter()
+        .flat_map(|a| a.steps.iter())
+        .chain(actions_cmds::pending_steps(&app.session, action))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+fn delete_selection(app: &mut PhotocraftApp) {
+    let Some(action) = app.ui.actions.selected else { return };
+    let step = app.ui.actions.selected_step;
+    let mut params = json!({"action": action});
+    if let Some(step) = step {
+        params["step"] = json!(step);
+    }
+    if app.run("actions.delete", params).is_err() {
+        return;
+    }
+    // Clear selection after deletion so a second click cannot delete a different
+    // step or unexpectedly fall back to deleting the entire action.
+    app.ui.actions.selected = None;
+    app.ui.actions.selected_step = None;
+    if step.is_none() && action < app.ui.actions.expanded.len() {
+        app.ui.actions.expanded.remove(action);
+    }
+}
+
 pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let recording = app.session.actions.recording;
-    let live = recording.map(|(from, _)| app.session.journal.iter().skip(from).filter(|(id, _)| actions_cmds::replayable(id)).count()).unwrap_or(0);
-    let rows: Vec<(String, Vec<String>)> =
-        app.session.actions.list.iter().map(|a| (a.name.clone(), a.steps.iter().map(|(id, _)| id.clone()).collect())).collect();
-    if app.ui.actions.selected.is_some_and(|i| i >= rows.len()) {
+    let rows: Vec<(String, Vec<String>)> = app.session.actions.list.iter().enumerate().map(|(i, a)| (a.name.clone(), visible_steps(app, i))).collect();
+    if app
+        .ui
+        .actions
+        .selected
+        .is_some_and(|i| i >= rows.len() || app.ui.actions.selected_step.is_some_and(|step| rows.get(i).is_none_or(|row| step >= row.1.len())))
+    {
         app.ui.actions.selected = None;
+        app.ui.actions.selected_step = None;
     }
     if app.ui.actions.expanded.len() > rows.len() {
         app.ui.actions.expanded.truncate(rows.len());
@@ -172,7 +209,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
         for (i, (name, steps)) in rows.iter().enumerate() {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-            let sel = app.ui.actions.selected == Some(i);
+            let sel = app.ui.actions.selected == Some(i) && app.ui.actions.selected_step.is_none();
             if sel {
                 ui.painter().rect_filled(rect, 0.0, t.row_selected);
             } else if resp.hovered() {
@@ -185,7 +222,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.painter().add(egui::Shape::convex_polygon(pts, t.text_dim, Stroke::NONE));
             crate::icons::paint(ui, Rect::from_center_size(pos2(rect.left() + 30.0, rect.center().y), vec2(16.0, 16.0)), "play", 11.0, t.icon);
             let recording_this = recording.is_some_and(|(_, r)| r == i);
-            let nsteps = steps.len() + if recording_this { live } else { 0 };
+            let nsteps = steps.len();
             ui.painter().text(pos2(rect.left() + 44.0, rect.center().y), Align2::LEFT_CENTER, name, egui::FontId::proportional(12.0), t.text);
             ui.painter().text(
                 pos2(rect.right() - 8.0, rect.center().y),
@@ -204,6 +241,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             if resp.clicked() {
                 app.ui.actions.selected = Some(i);
+                app.ui.actions.selected_step = None;
                 if resp.interact_pointer_pos().is_some_and(|p| p.x < rect.left() + 20.0) {
                     if app.ui.actions.expanded.len() <= i {
                         app.ui.actions.expanded.resize(i + 1, false);
@@ -226,9 +264,21 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 play_idx = Some(i);
             }
             if expanded {
-                for id in steps {
-                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-                    ui.painter().text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, label_of(id), egui::FontId::proportional(11.5), t.text_dim);
+                for (step, id) in steps.iter().enumerate() {
+                    let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
+                    let label = label_of(id);
+                    let selected = app.ui.actions.selected == Some(i) && app.ui.actions.selected_step == Some(step);
+                    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label));
+                    if selected {
+                        ui.painter().rect_filled(r, 0.0, t.row_selected);
+                    } else if response.hovered() {
+                        ui.painter().rect_filled(r, 0.0, t.hover.gamma_multiply(0.5));
+                    }
+                    ui.painter().text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, label, egui::FontId::proportional(11.5), t.text_dim);
+                    if response.clicked() {
+                        app.ui.actions.selected = Some(i);
+                        app.ui.actions.selected_step = Some(step);
+                    }
                 }
             }
         }
@@ -254,16 +304,14 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         if crate::icons::button(ui, "plus", 24.0, false, tl!("Create new action")).clicked() && !recording_now {
             begin_recording(app, false);
         }
-        if crate::icons::button(ui, "trash", 24.0, false, tl!("Delete")).clicked()
-            && !recording_now
-            && let Some(i) = app.ui.actions.selected
-            && app.run("actions.delete", json!({"action": i})).is_ok()
-        {
-            if i < app.ui.actions.expanded.len() {
-                app.ui.actions.expanded.remove(i);
+        let can_delete = app.ui.actions.selected.is_some() && (!recording_now || app.ui.actions.selected_step.is_some());
+        ui.add_enabled_ui(can_delete, |ui| {
+            let response = crate::icons::button(ui, "trash", 24.0, false, tl!("Delete"));
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, can_delete, tl!("Delete")));
+            if response.clicked() {
+                delete_selection(app);
             }
-            app.ui.actions.selected = None;
-        }
+        });
     });
     if let Some(i) = play_idx
         && let Ok(v) = app.run("actions.play", json!({"action": i}))
@@ -275,6 +323,42 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_shows_pending_steps_and_trash_deletes_only_the_clicked_step() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 40, "height": 40})).unwrap();
+        begin_recording(&mut app, false);
+        app.run("view.fitOnScreen", json!({})).unwrap();
+        app.run("view.zoomOut", json!({})).unwrap();
+        let mut h = Harness::builder().with_size(vec2(320.0, 400.0)).build_ui_state(|ui, app| panel(app, ui), app);
+        h.run_steps(2);
+        assert!(h.state().session.actions.recording.is_some());
+        h.get_by_label("Fit on Screen");
+        h.get_by_label("Zoom Out").click();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.actions.selected_step, Some(1));
+        h.get_by_label("Delete").click();
+        h.run_steps(2);
+        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen"]);
+        assert_eq!(h.state().session.actions.list.len(), 1);
+        assert!(h.state().session.actions.recording.is_some());
+        assert!(h.state().ui.actions.selected.is_none());
+        delete_selection(h.state_mut());
+        assert_eq!(h.state().session.actions.list.len(), 1, "repeated trash cannot delete the action");
+        h.state_mut().run("view.zoomIn", json!({})).unwrap();
+        h.run_steps(2);
+        h.get_by_label("Zoom In");
+        h.state_mut().run("actions.stop", json!({})).unwrap();
+        h.run_steps(2);
+        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen", "view.zoomIn"]);
+        h.get_by_label("Zoom In").click();
+        h.run_steps(2);
+        h.get_by_label("Delete").click();
+        h.run_steps(2);
+        assert_eq!(visible_steps(h.state(), 0), ["view.fitOnScreen"]);
+    }
 
     #[test]
     fn view_menu_commands_record_append_and_replay_after_resize() {
