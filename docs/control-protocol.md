@@ -89,6 +89,12 @@ store expose and persist the same setting; scripts keep using canonical command 
 | `actions.play` | `{"action": name or index, "from": step?}`. `from` and `failed.step` are 0-based. Returns `{action, ran, failed?:{step, id, error}}` and still returns ok when a step fails, so a partial run is reported. Leaves one history step per step that ran. Refuses to play while a play is already running. On an untrusted session each step is authorized the same way as a top-level command |
 | `actions.delete` | `{"action": name or index}` → `{deleted}`. Refused while recording |
 
+Desktop actions also record and replay View › Fit on Screen (`view.fitOnScreen`),
+100% (`view.actualPixels`), Zoom In and Zoom Out through their menu commands or shortcuts.
+Select an action and press Record to append steps; the plus button starts a new action.
+A final `["view.fitOnScreen", {}]` step fits the resized document when the canvas is laid out.
+Headless playback reports unsupported view commands as failed steps.
+
 In the desktop Actions panel, right-click an action to assign a function key (F1–F12),
 or choose None to remove it. The binding follows the action name, regardless of the selected
 row, and is saved in preferences. For example, the existing `edit.keyboardShortcuts` command

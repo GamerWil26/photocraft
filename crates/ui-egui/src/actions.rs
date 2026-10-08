@@ -23,7 +23,11 @@ pub struct ActionsUi {
 }
 
 fn label_of(id: &str) -> String {
-    photocraft_engine::commands::find(id).map(|c| c.label.trim_end_matches('…').to_string()).unwrap_or_else(|| id.to_string())
+    photocraft_engine::commands::find(id)
+        .map(|c| c.label)
+        .or_else(|| crate::menus::UI_COMMANDS.iter().find(|c| c.0 == id).map(|c| c.1))
+        .map(|label| label.trim_end_matches('…').to_string())
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// The selected action, or the first one when nothing is selected.
@@ -60,11 +64,72 @@ pub(crate) fn assign_shortcut(app: &mut PhotocraftApp, name: &str, shortcut: &st
     app.run("edit.keyboardShortcuts", json!({"set": set, "allowUnknown": true, "removeConflicts": false}))
 }
 
-fn begin_recording(app: &mut PhotocraftApp) {
+/// Replay edits synchronously, with view steps handled by the shell in the same order.
+/// Engine steps keep the headless action semantics (no dialogs or background jobs).
+pub(crate) fn play(app: &mut PhotocraftApp, params: &Value) -> Result<Value, String> {
+    let (action, from) = actions_cmds::playback_plan(&app.session, params).map_err(|e| e.to_string())?;
+    app.session.actions.playing += 1;
+    let mut ran = 0u64;
+    let mut failed = None;
+    for (i, (id, p)) in action.steps.iter().enumerate().skip(from) {
+        let result = (|| {
+            if let Some(auth) = app.session.authorize {
+                auth(id, p).map_err(|e| e.to_string())?;
+            }
+            if actions_cmds::shell_view_command(id) {
+                app.sync_views();
+                app.run(id, p.clone())
+            } else {
+                app.session.execute(id, p.clone()).map_err(|e| e.to_string())
+            }
+        })();
+        match result {
+            Ok(_) => ran += 1,
+            Err(error) => {
+                failed = Some(json!({"step": i, "id": id, "error": error}));
+                break;
+            }
+        }
+    }
+    app.session.actions.playing -= 1;
+    Ok(match failed {
+        Some(f) => json!({"action": action.name, "ran": ran, "failed": f}),
+        None => json!({"action": action.name, "ran": ran}),
+    })
+}
+
+/// Execute the actual menu command, not a synthetic keystroke. Fit is deferred
+/// until canvas layout, so it uses the dimensions after all preceding action steps.
+pub(crate) fn run_view(app: &mut PhotocraftApp, id: &str, params: Value) -> Result<Value, String> {
+    app.sync_views();
+    let i = app.session.active_index().ok_or("no document")?;
+    let v = app.ui.views.get_mut(i).ok_or("no document view")?;
+    match id {
+        "view.fitOnScreen" => v.fit_pending = true,
+        "view.zoomIn" => {
+            v.fit_pending = false;
+            v.zoom = crate::canvas::zoom_step(v.zoom, 1);
+        }
+        "view.zoomOut" => {
+            v.fit_pending = false;
+            v.zoom = crate::canvas::zoom_step(v.zoom, -1);
+        }
+        "view.actualPixels" => {
+            v.fit_pending = false;
+            v.zoom = 1.0;
+        }
+        _ => return Err(format!("unsupported view command: {id}")),
+    }
+    app.session.journal.push((id.into(), params));
+    Ok(Value::Null)
+}
+
+fn begin_recording(app: &mut PhotocraftApp, append: bool) {
     if app.session.actions.recording.is_some() {
         return;
     }
-    let Ok(v) = app.run("actions.record", json!({})) else { return };
+    let params = if append { app.ui.actions.selected.map_or(json!({}), |i| json!({"action": i})) } else { json!({}) };
+    let Ok(v) = app.run("actions.record", params) else { return };
     let Some(i) = v.get("index").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()) else { return };
     app.ui.actions.selected = Some(i);
     if app.ui.actions.expanded.len() <= i {
@@ -181,13 +246,13 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
         ui.painter().circle_filled(r.center(), 5.5, if recording_now { Color32::from_rgb(230, 60, 60) } else { t.icon });
         if rec.on_hover_text(tl!("Begin recording")).clicked() && !recording_now {
-            begin_recording(app);
+            begin_recording(app, true);
         }
         if crate::icons::button(ui, "play", 24.0, false, tl!("Play selection")).clicked() {
             play_idx = app.ui.actions.selected;
         }
         if crate::icons::button(ui, "plus", 24.0, false, tl!("Create new action")).clicked() && !recording_now {
-            begin_recording(app);
+            begin_recording(app, false);
         }
         if crate::icons::button(ui, "trash", 24.0, false, tl!("Delete")).clicked()
             && !recording_now
@@ -210,6 +275,66 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_menu_commands_record_append_and_replay_after_resize() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 160, "height": 100})).unwrap();
+        begin_recording(&mut app, false);
+        app.run("image.canvasSize", json!({"width": 80, "height": 60})).unwrap();
+        app.run("actions.stop", json!({})).unwrap();
+        begin_recording(&mut app, true);
+        crate::menus::invoke(&mut app, &ctx, "view.fitOnScreen", json!({})).unwrap();
+        app.run("actions.stop", json!({})).unwrap();
+        assert_eq!(app.session.actions.list.len(), 1);
+        assert_eq!(app.session.actions.list[0].steps.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["image.canvasSize", "view.fitOnScreen"]);
+        assert_eq!(label_of("view.fitOnScreen"), "Fit on Screen");
+        // Persisted actions retain the menu step, and playback fits the new document.
+        let saved = serde_json::to_string(&app.session.actions.list).unwrap();
+        app.session.actions.list = serde_json::from_str(&saved).unwrap();
+        app.run("file.new", json!({"width": 200, "height": 140})).unwrap();
+        app.run("view.actualPixels", json!({})).unwrap();
+        let result = app.run("actions.play", json!({"action": 0})).unwrap();
+        assert_eq!(result["ran"], 2);
+        assert!(result.get("failed").is_none(), "{result}");
+        let idx = app.session.active_index().unwrap();
+        assert!(app.ui.views[idx].fit_pending);
+        let doc = &app.session.active().unwrap().doc;
+        crate::canvas::fit_view(&mut app.ui.views[idx], doc, vec2(100.0, 100.0));
+        assert_eq!(app.ui.views[idx].zoom, 0.75);
+        assert_eq!(app.ui.views[idx].center, [40.0, 30.0]);
+        assert!(!app.ui.views[idx].fit_pending);
+    }
+
+    #[test]
+    fn view_action_failure_resume_and_authorization() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session
+            .actions
+            .list
+            .push(Action { name: "Fit".into(), steps: vec![("view.fitOnScreen".into(), json!({})), ("view.actualPixels".into(), json!({}))] });
+        let result = app.run("actions.play", json!({"action": "Fit"})).unwrap();
+        assert_eq!(result["ran"], 0);
+        assert_eq!(result["failed"]["step"], 0);
+        assert_eq!(app.session.actions.playing, 0);
+        app.run("file.new", json!({"width": 40, "height": 40})).unwrap();
+        app.session.authorize =
+            Some(
+                |id, _| {
+                    if id == "view.fitOnScreen" { Err(photocraft_engine::EngineError::BadParams { cmd: id.into(), msg: "denied view".into() }) } else { Ok(()) }
+                },
+            );
+        let result = app.run("actions.play", json!({"action": 0})).unwrap();
+        assert_eq!(result["ran"], 0);
+        assert!(result["failed"]["error"].as_str().unwrap().contains("denied view"));
+        let result = app.run("actions.play", json!({"action": 0, "from": 1})).unwrap();
+        assert_eq!(result["ran"], 1);
+        assert!(!app.ui.views[0].fit_pending);
+        assert!(app.run("actions.play", json!({"action": 0, "from": -1})).is_err());
+        app.session.actions.playing = 1;
+        assert!(app.run("actions.play", json!({"action": 0})).is_err());
+    }
 
     #[test]
     fn record_and_replay_on_another_document() {
