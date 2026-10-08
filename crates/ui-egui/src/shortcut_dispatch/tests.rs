@@ -395,3 +395,59 @@ fn a_shortcut_opening_a_dialog_takes_the_frames_later_keys() {
     assert_eq!(layer_count(&h), 5, "⌘Z didn't undo behind the dialog");
     assert_eq!(logged(&h), ["image.adjustments.levels"]);
 }
+
+#[test]
+fn named_action_function_key_replays_and_survives_preferences_roundtrip() {
+    let mut h = harness();
+    let action =
+        photocraft_engine::actions_cmds::Action { name: "LivePrint 2R".into(), steps: vec![("layer.new.layer".into(), json!({"name": "F6 overlay"}))] };
+    h.state_mut().session.actions.list.push(action);
+    crate::actions::assign_shortcut(h.state_mut(), "LivePrint 2R", "F6").unwrap();
+    let saved = serde_json::to_value(h.state().session.prefs()).unwrap();
+    let restored = serde_json::from_value(saved).unwrap();
+    h.state_mut().session.edit_prefs(|p| *p = restored);
+    h.state_mut().ui.actions.selected = None;
+    press(&mut h, "F6");
+    assert_eq!(active_name(&h), "F6 overlay");
+    assert_eq!(h.state().ui.status, "Played 1 steps");
+    assert!(!h.state().ui.status_error);
+    assert_eq!(take_log(&h.ctx), vec![(crate::actions::shortcut_id("LivePrint 2R"), Outcome::Ran)]);
+    h.state_mut().run("actions.delete", json!({"action": "LivePrint 2R"})).unwrap();
+    assert!(bindings(h.state()).iter().all(|(id, _)| !id.starts_with(crate::actions::SHORTCUT_PREFIX)));
+    assert!(bindings(h.state()).iter().any(|(_, sc)| *sc == parse("F6").unwrap()));
+}
+
+#[test]
+fn assigning_action_function_key_moves_it_and_reports_failed_steps() {
+    let mut h = harness();
+    for name in ["first", "second"] {
+        h.state_mut()
+            .session
+            .actions
+            .list
+            .push(photocraft_engine::actions_cmds::Action { name: name.into(), steps: vec![("no.such.command".into(), json!({}))] });
+    }
+    crate::actions::assign_shortcut(h.state_mut(), "first", "F6").unwrap();
+    crate::actions::assign_shortcut(h.state_mut(), "second", "F6").unwrap();
+    assert_eq!(h.state().session.prefs().shortcuts[&crate::actions::shortcut_id("first")], "");
+    h.state_mut().ui.actions.selected = Some(0);
+    press(&mut h, "F6");
+    assert!(h.state().ui.status_error);
+    assert!(h.state().ui.status.contains("Step 1 (no.such.command) failed"));
+    assert!(matches!(&take_log(&h.ctx)[..], [(id, Outcome::Failed(_))] if id == "actions.play:second"));
+}
+
+#[test]
+fn action_function_key_checks_automation_authorization() {
+    let mut h = harness();
+    h.state_mut().session.actions.list.push(photocraft_engine::actions_cmds::Action {
+        name: "restricted".into(),
+        steps: vec![("layer.new.layer".into(), json!({"name": "should not exist"}))],
+    });
+    crate::actions::assign_shortcut(h.state_mut(), "restricted", "F6").unwrap();
+    h.state_mut().services.automation_command = Some(Box::new(|id, _| if id == "actions.play" { Err("denied action playback".into()) } else { Ok(()) }));
+    h.state_mut().automation_input = true;
+    super::dispatch(h.state_mut(), &egui::Context::default(), "actions.play:restricted");
+    assert_eq!(h.state().ui.status, "denied action playback");
+    assert_eq!(active_name(&h), "paint");
+}
