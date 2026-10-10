@@ -617,7 +617,7 @@ mod tests {
         // A duplicate nested in a group must be found even when that group is collapsed.
         let second = s
             .edit("child", |doc, active| {
-                let child = photocraft_doc::Layer::raster("Photo", doc.format);
+                let child = photocraft_doc::Layer::raster("Photo", doc.pixel_format());
                 let id = child.id;
                 if let photocraft_doc::LayerContent::Group(group) = &mut doc.layer_mut(active.unwrap()).unwrap().content {
                     group.children.push(child);
