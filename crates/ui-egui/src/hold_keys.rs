@@ -2,16 +2,20 @@
 //!
 //! - Space: the Hand tool while held.
 //! - ⌘Space (Ctrl+Space off the Mac): Zoom In while held; a drag is a scrubby zoom.
-//! - ⌘⌥Space: Zoom Out while held.
+//! - ⌥Space (Alt+Space off the Mac): Zoom Out while held. ⌥ added to a held Zoom In (⌘⌥Space)
+//!   zooms out too, as ⌥ does with the Zoom tool.
+//! - The keys can be pressed in any order. Photoshop users usually hold Space first: on the Mac
+//!   that keeps ⌘Space from opening Spotlight, and many Linux desktops take ⌥Space for the window
+//!   menu when ⌥ comes first.
 //! - Space while a marquee, lasso or shape is being dragged repositions it; releasing Space
 //!   goes back to sizing it (the Crop tool does the same for its frame, `crop_ui`).
 //! - ⌘ (Ctrl off the Mac): the Move tool while held, with the painting, retouching, eraser,
 //!   gradient, eyedropper and other non-selection tools ([`cmd_moves`]); so ⌘-drag with the
 //!   Brush moves the layer, ⌘⌥-drag duplicates it first (`move_mods`), and a ⌘-click picks the
-//!   layer under the pointer, as with the Move tool itself. The selection tools do their own ⌘
-//!   handling in `canvas` (⌘ inside the selection cuts the selected pixels, outside it moves the
-//!   layer, #896), and the Hand, Zoom, Crop, Slice, Path Selection, shape, Pen and Type tools
-//!   keep ⌘ for themselves.
+//!   layer under the pointer, as with the Move tool itself; ⌘-arrows nudge ([`cmd_nudges`]). The
+//!   selection tools do their own ⌘ handling in `canvas` (⌘ inside the selection cuts the
+//!   selected pixels, outside it moves the layer, #896), and the Hand, Zoom, Crop, Slice, Path
+//!   Selection, shape, Pen and Type tools keep ⌘ for themselves.
 //!
 //! The current tool is never changed, so releasing the key gives the previous tool back. A
 //! temporary tool that started a drag lasts until the button is released, as in Photoshop.
@@ -59,11 +63,11 @@ impl Temporary {
 }
 
 /// Tools on which holding ⌘ (Ctrl off the Mac) is the Move tool. Photoshop excepts the Hand,
-/// Rotate View, Zoom, Slice, Path Selection, shape, Pen and Type tools (⌘ means something else to
-/// each) and the Crop tool's frame; a Free Transform in progress keeps ⌘ for its distort handles. The
-/// selection tools are left out too: for them ⌘ is handled per press in `canvas::tool_event`
-/// (`selection_drag_kind`, `command_moves_layer`), which needs the selection tool to stay in
-/// effect.
+/// Rotate View, Zoom, Slice, Path and Direct Selection, shape, Pen and Type tools (⌘ means
+/// something else to each) and the Crop tool's frame; a Free Transform in progress keeps ⌘ for its
+/// distort handles. The selection tools are left out too: for them ⌘ is handled per press in
+/// `canvas::tool_event` (`selection_drag_kind`, `command_moves_layer`), which needs the selection
+/// tool to stay in effect.
 pub fn cmd_moves(t: Tool) -> bool {
     !t.is_type()
         && !matches!(
@@ -76,6 +80,7 @@ pub fn cmd_moves(t: Tool) -> bool {
                 | Tool::Slice
                 | Tool::SliceSelect
                 | Tool::PathSelection
+                | Tool::DirectSelection
                 | Tool::Pen
                 | Tool::RectMarquee
                 | Tool::EllipseMarquee
@@ -84,6 +89,20 @@ pub fn cmd_moves(t: Tool) -> bool {
                 | Tool::MagicWand
         )
         && !crate::vector_ui::is_shape_tool(t)
+}
+
+/// Do ⌘-arrows (Ctrl off the Mac) nudge as the Move tool's arrows do (#2474)? Wherever ⌘ is the
+/// Move tool ([`cmd_moves`]), with the Move tool itself, and with the selection tools: in
+/// Photoshop their ⌘ is the Move tool too, so ⌘-arrows move the selected pixels (or the layer)
+/// while the plain arrows move the outline. Not while a polygon or Magnetic Lasso border is in
+/// progress, during Free Transform or while editing text.
+pub fn cmd_nudges(app: &PhotocraftApp) -> bool {
+    let t = app.ui.tool;
+    let selecting = crate::tool_feedback::is_selection_tool(t);
+    app.ui.transform.is_none()
+        && app.ui.text_edit.is_none()
+        && (cmd_moves(t) || t == Tool::Move || selecting)
+        && !(selecting && (!app.ui.polygon.is_empty() || app.ui.magnetic.active()))
 }
 
 /// Is ⌘ alone (no other temporary key) making the Move tool now?
@@ -114,8 +133,8 @@ fn held(i: &InputState, sc: &KeyboardShortcut) -> bool {
         && (!want.mac_cmd || m.mac_cmd)
 }
 
-/// The temporary tool whose key is held now, the most specific binding first (⌘⌥Space before
-/// ⌘Space before Space). Never while a text field has the keyboard.
+/// The temporary tool whose key is held now, the most specific binding first (⌘Space before
+/// Space). Never while a text field has the keyboard.
 pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> {
     if ctx.text_edit_focused() {
         return None;
@@ -124,21 +143,26 @@ pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> 
         let m = sc.modifiers;
         m.alt as u8 + m.shift as u8 + (m.command || m.mac_cmd) as u8 + (m.ctrl && !m.command) as u8
     };
-    let mut best: Option<(u8, Temporary)> = None;
+    let mut best: Option<(u8, Temporary, KeyboardShortcut)> = None;
     let mut cmd_move = false;
+    let mut alt = false;
     ctx.input(|i| {
         for t in Temporary::BOUND {
             if let Some(sc) = binding(app, t)
                 && held(i, &sc)
-                && best.is_none_or(|(n, _)| count(&sc) > n)
+                && best.is_none_or(|(n, ..)| count(&sc) > n)
             {
-                best = Some((count(&sc), t));
+                best = Some((count(&sc), t, sc));
             }
         }
         cmd_move = cmd_move_held(app, i);
+        alt = i.modifiers.alt;
     });
+    // ⌥ turns a held Zoom In around, as it does the Zoom tool: ⌘⌥Space zooms out (and wins the
+    // tie with ⌥Space), unless ⌥ is part of the Zoom In key itself.
+    let held = best.map(|(_, t, sc)| if t == Temporary::ZoomIn && alt && !sc.modifiers.alt { Temporary::ZoomOut } else { t });
     // A bound key (⌘Space is Zoom In) wins over ⌘ alone.
-    best.map(|(_, t)| t).or(cmd_move.then_some(Temporary::Move))
+    held.or(cmd_move.then_some(Temporary::Move))
 }
 
 /// Is the reposition key (the Hand key, any modifiers) down?
