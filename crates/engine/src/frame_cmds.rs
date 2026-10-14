@@ -137,7 +137,7 @@ fn new_frame(s: &mut Session, p: &Value) -> Result<Value> {
         let gid = match content {
             Some(id) => {
                 let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
-                if !matches!(l.content, LayerContent::Raster(_)) || crate::extra_cmds::is_background(l) {
+                if !matches!(l.content, LayerContent::Raster(_)) || doc.is_background(id) {
                     return Err(bad("only a pixel layer (not the Background) can go in a frame".into()));
                 }
                 let gid = doc.insert_above(Some(id), Layer::group(name, vec![]));

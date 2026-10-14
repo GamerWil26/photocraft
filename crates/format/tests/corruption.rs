@@ -419,6 +419,40 @@ fn tile_coordinates_outside_the_i32_pixel_range_are_rejected() {
     }
 }
 
+#[test]
+fn an_unlimited_blob_budget_still_loads_blobs() {
+    // `max_blob_bytes + 1` overflowed (debug panic; release read zero bytes, failing every blob).
+    let doc = rich_doc(ColorMode::Rgb, SampleType::U8);
+    let bytes = save_to_bytes(&doc, &SaveOptions::default()).unwrap();
+    let opts = LoadOptions { max_blob_bytes: usize::MAX, ..LoadOptions::default() };
+    assert_eq!(load_from_bytes_with(&bytes, &opts).unwrap(), doc);
+}
+
+/// Rewrites the first pattern's declared size (its tiles stay as saved).
+fn with_pattern_size(w: u64, h: u64) -> Vec<u8> {
+    rebuild(sample_cached(), |n, d| {
+        if n != "manifest.json" {
+            return Some(d);
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&d).unwrap();
+        let p = &mut v["document"]["patterns"][0];
+        assert!(p.is_object(), "the sample has a pattern");
+        p["width"] = w.into();
+        p["height"] = h.into();
+        Some(serde_json::to_vec(&v).unwrap())
+    })
+}
+
+#[test]
+fn pattern_sizes_from_the_file_are_checked() {
+    // A pattern can claim any size without tiles; painting it allocated per pixel (abort).
+    let huge = load_from_bytes(&with_pattern_size(65_535, 65_535));
+    assert!(matches!(huge, Err(FormatError::LimitExceeded(_))), "{huge:?}");
+    let empty = load_from_bytes(&with_pattern_size(0, 24));
+    assert!(matches!(empty, Err(FormatError::Corrupt(_))), "{empty:?}");
+    assert!(load_from_bytes(&with_pattern_size(32, 24)).is_ok());
+}
+
 /// A canvas is a few bytes of manifest JSON; one past the budget is refused before any work (#2935).
 /// The default budget is the largest canvas the app creates (300000 × 300000, as `file.new`,
 /// Canvas Size and PSB import allow), so everything a user can save reopens.

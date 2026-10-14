@@ -31,7 +31,7 @@ id = "TOOL-213-4"
 target = "Content-Aware Move tool reusing inpaint completion"
 status = "partial"
 issue = 213
-note = "paint.contentAwareMove (retouch_cmds/content_aware_move.rs: move/extend, Structure 1-7, Color 0-10, Sample All Layers, Transform On Drop's scaleX/scaleY/rotate; background job) + Tool::ContentAwareMove (J group: lasso, then drag; Transform On Drop puts a scale/rotate box on the dropped patch, cam_transform.rs: Enter commits as one step, Esc cancels). Missing: a live preview of the result (the drag and the box show the outline only)"
+note = "paint.contentAwareMove (retouch_cmds/content_aware_move.rs: move/extend, Structure 1-7, Color 0-10, Sample All Layers, Transform On Drop's scaleX/scaleY/rotate; background job) + Tool::ContentAwareMove (J group: lasso, then drag; Transform On Drop puts a scale/rotate box on the dropped patch, cam_transform.rs: Enter commits as one step, Esc cancels). cam_preview.rs: once the pointer or the box rests, the result shows (a cancellable background job on a smaller sampling window, small selections only, #4385). Missing: a progressive preview for big selections"
 
 [[item]]
 id = "TOOL-213-5"
@@ -59,7 +59,7 @@ id = "TOOL-213-8"
 target = "Clone Source: W/H link, drawn overlay (opacity/blend/clip/auto-hide), Alt target cursor"
 status = "partial"
 issue = 213
-note = "Clone Source overlay drawn with opacity, inversion, circular clipping, auto-hide and the Normal/Darken/Lighten/Difference blend against the image under the brush (canvas.rs draw_clone_preview, clone_source::overlay_blend); W/H link (cloneSource.set linked, panel chain button, #3298); custom-tip clipping remains missing"
+note = "Clone Source overlay drawn with opacity, inversion, circular clipping, auto-hide and the Normal/Darken/Lighten/Difference blend against the image under the brush (canvas.rs draw_clone_preview, clone_source::overlay_blend); a shaped tip (sampled bitmap, rotation, roundness) clips the overlay to its outline (brush_cursor::tip_mask, #4372); W/H link (cloneSource.set linked, panel chain button, #3298)"
 
 [[item]]
 id = "TOOL-213-9"
@@ -297,7 +297,7 @@ id = "TOOL-213-19"
 target = "Remove tool: paint over an object (or circle it) and it is filled from its surroundings"
 status = "partial"
 issue = 213
-note = "paint.remove (retouch_cmds/remove.rs, background job) + Tool::Remove in the J flyout; loops close over what they enclose; fill by non-local patch completion with texture features, onion-peel start, best-patch copy and gradient-domain seam hiding (algo/nonlocal.rs, Newson et al. IPOL 2017); sparse holes in tiles (algo/remove.rs). remove_quality on 20 holes in public-domain photos: the fill keeps 0.89 of the texture it replaces (0.54 with Content-Aware Fill's completion), edge gradient 1.03 of the original's; remove_bench 24 MP: 100 px ring 120 ms, 1000 px ring 2.5 s, 3000 px line 1.7 s. Missing: generative AI mode, Remove after each stroke off, live preview of the result"
+note = "paint.remove (retouch_cmds/remove.rs, background job) + Tool::Remove in the J flyout; loops close over what they enclose; fill by non-local patch completion with texture features, onion-peel start, best-patch copy and gradient-domain seam hiding (algo/nonlocal.rs, Newson et al. IPOL 2017); sparse holes in tiles (algo/remove.rs). remove_quality on 20 holes in public-domain photos: the fill keeps 0.89 of the texture it replaces (0.54 with Content-Aware Fill's completion), edge gradient 1.03 of the original's; remove_bench 24 MP: 100 px ring 120 ms, 1000 px ring 2.5 s, 3000 px line 1.7 s. Options bar: Sample All Layers, Create a new layer (the fill on a new layer above, `newLayer`), Remove after each stroke off (strokes collect as a tint and ↩ applies them as one `strokes` job, Esc drops them). Missing: generative AI mode, live preview of the result"
 
 [[item]]
 id = "TOOL-1045-1"

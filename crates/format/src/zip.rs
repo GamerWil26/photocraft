@@ -201,7 +201,12 @@ impl<'a> ZipReader<'a> {
         if e.uncompressed > max {
             return Err(FormatError::LimitExceeded(format!("zip entry `{}` is {} bytes (max {max})", e.name, e.uncompressed)));
         }
-        let raw = &self.bytes[e.data_offset..e.data_offset + e.compressed];
+        // `Entry` is public and cloneable: one from another archive must not index out of range.
+        let raw = e
+            .data_offset
+            .checked_add(e.compressed)
+            .and_then(|end| self.bytes.get(e.data_offset..end))
+            .ok_or_else(|| FormatError::corrupt(format!("zip entry `{}` out of range", e.name)))?;
         let data = match e.method {
             0 => raw.to_vec(),
             8 => {
@@ -364,6 +369,19 @@ mod tests {
         forged[central + 24..central + 28].copy_from_slice(&u32::MAX.to_le_bytes());
         let archive = ZipReader::new(&forged).unwrap();
         assert!(matches!(archive.read_by_name("manifest.json", usize::MAX), Err(FormatError::Corrupt(_))));
+    }
+
+    #[test]
+    fn an_entry_from_another_archive_is_an_error_not_a_panic() {
+        let mut big = ZipWriter::new();
+        big.add("a", &[7; 4096]).unwrap();
+        let big = big.finish().unwrap();
+        let foreign = ZipReader::new(&big).unwrap().entries[0].clone();
+        let mut small = ZipWriter::new();
+        small.add("a", b"x").unwrap();
+        let small = small.finish().unwrap();
+        let r = ZipReader::new(&small).unwrap();
+        assert!(matches!(r.read(&foreign, usize::MAX), Err(FormatError::Corrupt(_))));
     }
 
     #[test]

@@ -167,17 +167,7 @@ fn storage_selection_and_tile_sizes_match_original_kernels() {
                     FilterParams::Wind { method, from_right, seed } => wind_direct(&src, area, &ctx, method, from_right, seed),
                     _ => continue,
                 };
-                let original = s.read_region(area);
-                for (i, px) in raw.chunks_exact_mut(fmt.channels()).enumerate() {
-                    let (x, y) = (area.x0 + (i % area.width() as usize) as i32, area.y0 + (i / area.width() as usize) as i32);
-                    let k = selection.sample_channel(x, y, 0);
-                    if k >= 1.0 {
-                        continue;
-                    }
-                    for (c, v) in px.iter_mut().enumerate() {
-                        *v = original[i * fmt.channels() + c] + (*v - original[i * fmt.channels() + c]) * k;
-                    }
-                }
+                crate::mix_selection(&mut raw, area, &selection, &src, fmt.alpha);
                 let mut want = s.clone();
                 want.write_region(area, &raw);
                 for tile in [1, 7, 17, 256] {

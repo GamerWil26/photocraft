@@ -4,8 +4,9 @@
 //! drop shadows, outer glows, outer bevel, then the layer itself (content at
 //! fill opacity) with pattern/gradient/colour overlays, satin, inner glows,
 //! inner shadows, strokes and the inner bevel on top. Exterior effects blend
-//! straight into the backdrop with their own modes; the layer and its
-//! interior effects blend with the layer's mode. Emboss and pillow emboss then
+//! straight into the backdrop with their own modes; the layer blends with its
+//! mode and the interior effects paint over the result, or blend with it as a
+//! group (Blend Interior Effects as Group, [`premerges_layer`]). Emboss and pillow emboss then
 //! shade the composited result (inside and outside halves). Layer opacity
 //! applies to the whole stack; fill opacity only to the layer's own pixels.
 //!
@@ -14,10 +15,10 @@
 //! of strokes blend onto the backdrop with their own modes, an upper stroke covering the
 //! lower ones. Drop shadows are knocked out only through see-through fill.
 //!
-//! Shapes come from the layer's alpha (after its mask). Strokes and spread / choke measure
-//! distances with a 5 × 5 chamfer metric seeded at sub-pixel edge offsets (as Photoshop does);
-//! precise glows and chiselled bevels use an exact Euclidean distance transform. Soft falloffs
-//! are two box blurs (a tent).
+//! Shapes come from the layer's alpha (after its mask). A stroke's outer edge, and precise glows /
+//! chiselled bevels, use an exact Euclidean transform: a 5 × 5 chamfer's level sets are polygons,
+//! which a wide stroke shows as flat facets (#3646). Inside stroke edges and spread / choke keep the
+//! cheaper chamfer. Soft falloffs are two box blurs (a tent).
 
 use photocraft_color::blend::BlendMode;
 use photocraft_doc::Pattern;
@@ -43,7 +44,7 @@ pub fn margin(layer: &Layer) -> i32 {
             Effect::DropShadow(s) | Effect::InnerShadow(s) => s.distance + s.size,
             Effect::OuterGlow(g) | Effect::InnerGlow(g) => g.size,
             Effect::Stroke(s) => s.size,
-            Effect::Satin(s) => s.distance + s.size,
+            Effect::Satin(s) => satin_distance(s) + s.size,
             Effect::BevelEmboss(b) => b.size + b.soften,
             _ => 0.0,
         };
@@ -94,6 +95,10 @@ impl Map {
     /// Shifted copy (bilinear), outside reads `outside`.
     fn shifted(&self, dx: f32, dy: f32, outside: f32) -> Map {
         let mut out = Map::new(self.w, self.h, 0.0);
+        // A hostile distance (±1e30, inf, NaN) would overflow the i64 offsets below; no shift beyond
+        // 2^30 px can land inside a map, so clamp (non-finite shifts read as none).
+        let reach = |d: f32| if d.is_finite() { d.clamp(-1.0e9, 1.0e9) } else { 0.0 };
+        let (dx, dy) = (reach(dx), reach(dy));
         let (fx, fy) = (dx.floor(), dy.floor());
         let (ax, ay) = (dx - fx, dy - fy);
         let s = |x: i64, y: i64| if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 { outside } else { self.v[y as usize * self.w + x as usize] };
@@ -389,10 +394,28 @@ fn dist_outside(s: &Map) -> Vec<f32> {
 /// Distance metric for effect distance fields.
 #[derive(Clone, Copy, PartialEq)]
 enum Metric {
-    /// Exact Euclidean (precise glows, bevels).
+    /// Exact Euclidean (effect edges).
     Euclidean,
-    /// 5 × 5 chamfer (strokes, spread / choke; see [`chamfer_nearest`]).
+    /// 5 × 5 chamfer (inside strokes, spread / choke; see [`chamfer_nearest`]).
     Chamfer,
+}
+
+/// Outside width from which a stroke's outer edge uses the exact Euclidean transform instead of
+/// the fitted 5 × 5 chamfer.
+///
+/// The chamfer's level sets are octagons: measured against a point source, its distance exceeds
+/// the Euclidean radius by up to `0.027 · r` px — 0.48 px at r = 18 (the widest outside stroke any
+/// Photoshop oracle matches with the chamfer) and 1.6 px at r = 60, where a wide stroke's boundary
+/// visibly facets (#3646). Half a pixel of deviation is reached at r ≈ 19, so strokes narrower
+/// than 20 px keep the chamfer, whose sub-pixel edge seeding Photoshop matches at small offsets,
+/// and wider ones stay round.
+pub const STROKE_CHAMFER_MAX: f32 = 20.0;
+
+/// Whether a stroke whose outside edge is `out_w` px wide uses the exact Euclidean transform (round)
+/// rather than the 5 × 5 chamfer's octagon ([`STROKE_CHAMFER_MAX`]). The CPU compositor and the GPU
+/// compositor's `program_with` both call this, so a stroke picks the same field in each.
+pub fn stroke_outside_exact(out_w: f32) -> bool {
+    out_w >= STROKE_CHAMFER_MAX
 }
 
 fn dist_outside_by(s: &Map, m: Metric) -> Vec<f32> {
@@ -882,6 +905,16 @@ fn contour_lut(c: &Contour) -> Option<Vec<f32>> {
     }
 }
 
+/// Satin's coverage transfer: the contour read from its far end, `|c(1 − v) − c(1)|`. Measured in
+/// Photoshop 27.11: Cone and Cone − Inverted Satins are identical, and a Gaussian Satin runs under
+/// the diagonal (0.36 at 0.5) while the same Gaussian on a glow or gloss runs over it (0.65).
+/// `None` = identity.
+pub fn satin_lut(c: &Contour) -> Option<Vec<f32>> {
+    let lut = contour_lut(c)?;
+    let end = lut.last().copied().unwrap_or(1.0);
+    Some(lut.iter().rev().map(|v| (v - end).abs()).collect())
+}
+
 /// Interpolated lookup in a 0..=1 table (as the GPU's `lut()`).
 fn lut_at(l: &[f32], v: f32) -> f32 {
     let x = v.clamp(0.0, 1.0) * (l.len() - 1) as f32;
@@ -1114,27 +1147,24 @@ fn shadow_map(shape: &Map, s: &Shadow, light: &GlobalLight, inner: bool, origin:
 }
 
 fn glow_map(shape: &Map, g: &Glow, inner: bool, origin: (i32, i32)) -> Map {
-    let src = if inner {
-        match g.source {
-            GlowSource::Edge => shape.clone().map(|a| 1.0 - a),
-            GlowSource::Center => shape.clone(),
-        }
-    } else {
-        shape.clone()
-    };
+    // An inner glow is built from the edge inwards; a centre-source glow is its inverse, taken
+    // after the contour and Range (Photoshop 27.11, measured: the centre glow is exactly
+    // 1 − the edge glow, for both techniques).
+    let src = if inner { shape.clone().map(|a| 1.0 - a) } else { shape.clone() };
     let mut m = match g.technique {
         GlowTechnique::Precise => {
-            // An inner glow, from either source, measures from the edge inwards; a centre glow is
-            // the inverse below (the distance outside is ≤ 0 everywhere inside, #966).
+            // Coverage falls linearly from 0.5 at the edge to 0 at `size + 1` px (centre to
+            // centre), solid within the spread / choke: after the default 50 % Range that is
+            // Photoshop's 1 − D / (size + 1) beyond the solid part (measured: outer and inner,
+            // sizes 10 and 20, spread 0 and 40 %, choke 0 and 30 %: within 1 level; other Range
+            // values are unmeasured). The distances here are 0.5 px short of centre to centre.
             let d = if inner { dist_inside(shape) } else { dist_outside(&src) };
             let solid = g.size * g.spread;
-            let soft = (g.size - solid).max(1e-3);
+            let soft = (g.size + 1.0 - solid).max(1e-3);
             let mut m = Map::new(shape.w, shape.h, 0.0);
             for (o, d) in m.v.iter_mut().zip(d) {
-                *o = if d <= solid { 1.0 } else { (1.0 - (d - solid) / soft).clamp(0.0, 1.0) };
-            }
-            if inner && g.source == GlowSource::Center {
-                m = m.map(|v| 1.0 - v);
+                let d = d + 0.5;
+                *o = if d <= solid { 1.0 } else { 0.5 * (1.0 - (d - solid) / soft).clamp(0.0, 1.0) };
             }
             m
         }
@@ -1142,16 +1172,13 @@ fn glow_map(shape: &Map, g: &Glow, inner: bool, origin: (i32, i32)) -> Map {
             let (r, bw) = spread_split(g.size, g.spread);
             let mut m = dilate(&src, r);
             blur(&mut m, bw);
-            if inner && g.source == GlowSource::Center {
-                // Brightest in the middle: coverage from the distance to the edge.
-                let mut e = dilate(&shape.clone().map(|a| 1.0 - a), r);
-                blur(&mut e, bw);
-                m = e.map(|v| 1.0 - v);
-            }
             m
         }
     };
     m = apply_lut(m, glow_lut(g));
+    if inner && g.source == GlowSource::Center {
+        m = m.map(|v| 1.0 - v);
+    }
     noise(&mut m, g.noise, origin.0, origin.1);
     if inner {
         for (v, a) in m.v.iter_mut().zip(&shape.v) {
@@ -1461,7 +1488,9 @@ pub fn bevel_geom(b: &Bevel) -> BevelGeom {
     BevelGeom {
         paint,
         width,
-        depth: b.depth * if smooth { width } else { size } * sign,
+        // A bevel rises `depth × width / 2` px: Smooth with a slope falling from `depth` at the
+        // edge (the tent), a chisel with the constant slope of its ramp (see `bevel_chisel_h`).
+        depth: b.depth * if smooth { width } else { size / 2.0 } * sign,
         pillow: b.style == BevelStyle::PillowEmboss,
         chisel_soft: if b.technique == BevelTechnique::ChiselSoft { (size / 4.0).max(1.0) } else { 0.0 },
     }
@@ -1482,10 +1511,13 @@ fn bevel_height(shape: &Map, b: &Bevel, g: &BevelGeom, tex: &TextureCtx, pattern
         let sharp = sharp_edges(shape);
         let (din, dout) = (bevel_dist_inside(shape, &sharp, size), bevel_dist_outside(shape, &sharp, size));
         let mut h = Map::new(shape.w, shape.h, 0.0);
+        let soft = g.chisel_soft > 0.0;
         for i in 0..h.v.len() {
-            h.v[i] = bevel_chisel_h(g.paint, size, din[i], dout[i]);
+            h.v[i] = bevel_chisel_h(g.paint, size, din[i], dout[i], soft);
         }
-        if g.chisel_soft > 0.0 {
+        // Inner and outer Chisel Soft are not blurred in Photoshop (their facets equal Chisel
+        // Hard's across a straight edge); emboss styles keep the blur until measured.
+        if soft && g.paint == BevelPaint::Both {
             tent(&mut h, g.chisel_soft);
         }
         h
@@ -1527,17 +1559,46 @@ pub struct TextureCtx<'a> {
 }
 
 /// Chiselled height from the inside / outside distances (keep in sync with `fs_mbevelh`).
-pub fn bevel_chisel_h(paint: BevelPaint, size: f32, din: f32, dout: f32) -> f32 {
+///
+/// Photoshop 27.11, measured across straight edges (sizes 10 and 20, depth 100 and 300): a chisel
+/// facet has the constant slope `depth × size / (2 (size + 1))`, i.e. one height step of
+/// `1 / (size + 1)` per pixel at the `depth × size / 2` scale of [`bevel_geom`]. Inner Hard's ramp
+/// runs from half a pixel beyond the edge to `size + ½` (the facet is flat right up to the edge
+/// pixel); Inner Soft starts a pixel further out, so its edge pixel is steeper; Outer Hard ends a
+/// pixel further out. All within 1 level of Photoshop on those profiles.
+pub fn bevel_chisel_h(paint: BevelPaint, size: f32, din: f32, dout: f32, soft: bool) -> f32 {
+    let ramp = size + 1.0;
     match paint {
-        BevelPaint::Outer => 1.0 - (dout / size).clamp(0.0, 1.0),
-        BevelPaint::Both => {
-            if din > 0.0 {
-                0.5 + 0.5 * (din / (size / 2.0)).clamp(0.0, 1.0)
+        BevelPaint::Outer if !soft => {
+            let top = (size + 2.0) / ramp;
+            if dout > 0.0 { ((size + 1.5 - dout) / ramp).clamp(0.0, top) } else { top }
+        }
+        // Outer Soft: Outer Hard's ramp a pixel shorter, with a steeper edge pixel.
+        BevelPaint::Outer => {
+            if dout > 0.0 {
+                1.0 - ((dout + 0.5) / ramp).clamp(0.0, 1.0)
             } else {
-                0.5 - 0.5 * (dout / (size / 2.0)).clamp(0.0, 1.0)
+                (size + 2.0) / ramp
             }
         }
-        BevelPaint::Inner => (din / size).clamp(0.0, 1.0),
+        BevelPaint::Both => {
+            let half = size / 2.0 + 0.5;
+            if din > 0.0 { 0.5 + 0.5 * (din / half).clamp(0.0, 1.0) } else { 0.5 - 0.5 * (dout / half).clamp(0.0, 1.0) }
+        }
+        BevelPaint::Inner if soft => {
+            if din > 0.0 {
+                ((din + 1.5) / ramp).clamp(0.0, (size + 2.0) / ramp)
+            } else {
+                0.0
+            }
+        }
+        BevelPaint::Inner => {
+            if din > 0.0 {
+                ((din + 0.5) / ramp).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -1555,7 +1616,9 @@ fn bevel_maps(shape: &Map, b: &Bevel, light: &GlobalLight, tex: &TextureCtx, pat
     // past the blur's reach (a raised 4-neighbour: it still slopes; psd-tools layer_effects'
     // emboss shadow runs one row past it), outer bevels don't (Photoshop oracle
     // bevel-outer-smooth).
-    let reach_past = g.paint == BevelPaint::Both;
+    // Outer chisel bevels too: the pixel where their ramp reaches zero still slopes (Photoshop
+    // 27.11 shades it, half strength, at `size + 1½` px out).
+    let reach_past = g.paint == BevelPaint::Both || (g.paint == BevelPaint::Outer && b.technique != BevelTechnique::Smooth);
     let on_bevel = |x: i64, y: i64| {
         hmap.get(x, y) > BEVEL_H_EPS || (reach_past && [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(dx, dy)| hmap.get(x + dx, y + dy) > BEVEL_H_EPS))
     };
@@ -1612,9 +1675,14 @@ pub struct FxMaps {
     per: Vec<Vec<Map>>,
     bevel_paint: Vec<BevelPaint>,
     din: Option<Vec<f32>>,
+    /// Stroke outside distance below [`STROKE_CHAMFER_MAX`]: the fitted 5 × 5 chamfer.
     dout: Option<Vec<f32>>,
-    /// Shape layers: distance outside the vector outline (from local coverage).
+    /// Stroke outside distance at or above [`STROKE_CHAMFER_MAX`]: the exact Euclidean transform.
+    dout_exact: Option<Vec<f32>>,
+    /// Shape layers: chamfer distance outside the vector outline (from local coverage).
     vdout: Option<Vec<f32>>,
+    /// Shape layers: exact Euclidean distance outside the vector outline (from local coverage).
+    vdout_exact: Option<Vec<f32>>,
     /// `shape` joins the alpha with a filled shape's outline (`crate::effect_outline`).
     outline: bool,
     /// Frames of gradient strokes by outside width (bits): see [`stroke_frame`].
@@ -1633,7 +1701,14 @@ impl FxMaps {
     pub fn bytes(&self) -> usize {
         let n = self.shape.v.len();
         let maps: usize = self.per.iter().map(Vec::len).sum();
-        (1 + maps + usize::from(self.din.is_some()) + usize::from(self.dout.is_some()) + usize::from(self.vdout.is_some())) * n * 4
+        (1 + maps
+            + usize::from(self.din.is_some())
+            + usize::from(self.dout.is_some())
+            + usize::from(self.dout_exact.is_some())
+            + usize::from(self.vdout.is_some())
+            + usize::from(self.vdout_exact.is_some()))
+            * n
+            * 4
     }
 
     fn crop_vec(&self, v: &[f32], to: Rect, fill: f32) -> Vec<f32> {
@@ -1659,8 +1734,14 @@ impl FxMaps {
     }
 }
 
+/// The distance the two satin copies are offset by. Photoshop draws Distance 0 as 1 px (an
+/// edge band of 2/size, measured in Photoshop 27.11), not as two copies cancelling out.
+pub fn satin_distance(s: &photocraft_doc::effects::Satin) -> f32 {
+    s.distance.max(1.0)
+}
+
 fn satin_map(shape: &Map, s: &photocraft_doc::effects::Satin) -> Map {
-    let (dx, dy) = offset(s.angle, s.distance);
+    let (dx, dy) = offset(s.angle, satin_distance(s));
     let mut a = shape.shifted(dx, dy, 0.0);
     let mut b = shape.shifted(-dx, -dy, 0.0);
     // Two box passes of the satin size (fitted: 0.2 % mean error on psd-tools layer_effects).
@@ -1670,7 +1751,7 @@ fn satin_map(shape: &Map, s: &photocraft_doc::effects::Satin) -> Map {
     if s.invert {
         m = m.map(|v| 1.0 - v);
     }
-    let mut m = apply_contour(m, &s.contour);
+    let mut m = apply_lut(m, satin_lut(&s.contour));
     for (v, a) in m.v.iter_mut().zip(&shape.v) {
         *v *= a;
     }
@@ -1714,10 +1795,34 @@ pub(crate) fn build_maps_prepared(
         .collect();
     let has_stroke = items.iter().any(|e| matches!(e, Effect::Stroke(_)));
     let vector_shape = matches!(layer.content, photocraft_doc::LayerContent::Shape(_));
-    let (din, dout) = if has_stroke { (Some(dist_inside_by(&shape, Metric::Chamfer)), Some(dist_outside_by(&shape, Metric::Chamfer))) } else { (None, None) };
-    // Without an outline (unfilled shapes), estimate the vector outline from local coverage.
+    // A stroke's outer edge keeps the 5 × 5 chamfer while its outside width is under
+    // `STROKE_CHAMFER_MAX` — Photoshop matches the chamfer's sub-pixel edge seeding at small
+    // offsets — and uses the exact Euclidean transform at or above it, where the chamfer's octagon
+    // facets a wide stroke (#3646). Inside stroke distances always keep the chamfer. Each outer
+    // field is built only when a stroke of that width is present; the compositor picks per stroke,
+    // so one layer may hold both a narrow and a wide stroke.
+    let out_widths: Vec<f32> =
+        items.iter().filter_map(|e| if let Effect::Stroke(st) = e { Some(stroke_widths(st).1) } else { None }).filter(|w| *w > 0.0).collect();
+    let chamfer_out = out_widths.iter().any(|&w| !stroke_outside_exact(w));
+    let exact_out = out_widths.iter().any(|&w| stroke_outside_exact(w));
+    let (din, dout, dout_exact) = if has_stroke {
+        (
+            Some(dist_inside_by(&shape, Metric::Chamfer)),
+            chamfer_out.then(|| dist_outside_by(&shape, Metric::Chamfer)),
+            exact_out.then(|| dist_outside_by(&shape, Metric::Euclidean)),
+        )
+    } else {
+        (None, None, None)
+    };
+    // Without an outline (unfilled shapes), estimate the vector outline from local coverage; it
+    // picks the chamfer or the exact transform the same way.
     let outline = crate::effect_outline(layer).is_some();
-    let vdout = (has_stroke && vector_shape && !outline).then(|| dist_outside_by(&local_coverage(&shape), Metric::Chamfer));
+    let (vdout, vdout_exact) = if has_stroke && vector_shape && !outline {
+        let lc = local_coverage(&shape);
+        (chamfer_out.then(|| dist_outside_by(&lc, Metric::Chamfer)), exact_out.then(|| dist_outside_by(&lc, Metric::Euclidean)))
+    } else {
+        (None, None)
+    };
     let mut frames: Vec<(u32, Rect)> = Vec::new();
     for e in &items {
         if let Effect::Stroke(st) = e
@@ -1729,7 +1834,7 @@ pub(crate) fn build_maps_prepared(
             }
         }
     }
-    FxMaps { rect, shape, per, bevel_paint, din, dout, vdout, outline, frames }
+    FxMaps { rect, shape, per, bevel_paint, din, dout, dout_exact, vdout, vdout_exact, outline, frames }
 }
 
 /// Far outside any shape (distance fill for cropped distance fields).
@@ -1743,6 +1848,14 @@ fn knock_out_exterior(map: &mut Map, shape: &Map, fill_opacity: f32) {
     for (coverage, alpha) in map.v.iter_mut().zip(&shape.v) {
         *coverage *= 1.0 - alpha * see_through;
     }
+}
+
+/// Blend Interior Effects as Group off (Photoshop's default): the layer's mode applies to its
+/// own pixels only, and the interior effects paint over the blended result. The layer is merged
+/// into the backdrop before they paint, so an Overlay colour overlay on a black Color-mode layer
+/// tints the grey beneath it (#3996). Normal-like modes give the same result either way.
+pub fn premerges_layer(layer: &Layer) -> bool {
+    !layer.advanced.blend_interior && !matches!(layer.blend, BlendMode::Normal | BlendMode::PassThrough | BlendMode::Dissolve)
 }
 
 /// Composites `content` (the layer's own pixels over `big`, alpha already
@@ -1843,6 +1956,13 @@ pub(crate) fn composite_with_effects_prepared(
         }
     };
     let mut lay = Buffer { rect: big, px: content.px.iter().zip(&shape.v).enumerate().map(|(i, (p, a))| [p[0], p[1], p[2], lay_alpha(i, p, *a)]).collect() };
+    let gamma = crate::text_gamma(layer);
+    let premerge = premerges_layer(layer);
+    if premerge {
+        for (lp, wp) in lay.px.iter_mut().zip(&work.px) {
+            *lp = psblend::composite_gamma(layer.blend, *wp, *lp, 1.0, gamma);
+        }
+    }
     let rel = |m: Map| -> Map {
         let v = m.v.iter().zip(&shape.v).map(|(m, a)| if inside(*a) { (m / a).min(1.0) } else { 0.0 }).collect();
         Map { w: m.w, h: m.h, v }
@@ -1897,10 +2017,13 @@ pub(crate) fn composite_with_effects_prepared(
     // Strokes. Inside parts are painted over the layer (bottom instance first); outside parts
     // are slid beneath it, so the first listed (top) instance is processed first.
     let strokes: Vec<&photocraft_doc::StrokeFx> = items.iter().filter_map(|e| if let Effect::Stroke(s) = e { Some(s) } else { None }).collect();
-    let (din, dout) = match (&maps.din, &maps.dout) {
-        (Some(a), Some(b)) if !strokes.is_empty() => (maps.crop_vec(a, big, 0.0), maps.crop_vec(b, big, FAR)),
-        _ => (Vec::new(), Vec::new()),
-    };
+    let ready = !strokes.is_empty();
+    let din = if ready { maps.din.as_ref().map(|a| maps.crop_vec(a, big, 0.0)).unwrap_or_default() } else { Vec::new() };
+    // A stroke's outer edge picks the chamfer or the exact field by its width
+    // ([`stroke_outside_exact`]); both are cropped here, and only the ones a stroke needs exist.
+    let crop_out = |v: &Option<Vec<f32>>| v.as_ref().map(|b| maps.crop_vec(b, big, FAR));
+    let (dout, dout_exact, vdout, vdout_exact) =
+        if ready { (crop_out(&maps.dout), crop_out(&maps.dout_exact), crop_out(&maps.vdout), crop_out(&maps.vdout_exact)) } else { (None, None, None, None) };
     let widths = stroke_widths;
     // A gradient stroke aligned with the layer spans the stroke's own extent.
     let frame = |st: &photocraft_doc::StrokeFx| maps.stroke_frame(st).unwrap_or(sb);
@@ -1928,7 +2051,9 @@ pub(crate) fn composite_with_effects_prepared(
     for (p, a) in lay.px.iter_mut().zip(&shape.v) {
         p[3] *= a.min(1.0);
     }
-    let vdout = maps.vdout.as_ref().filter(|_| vector_shape && !strokes.is_empty()).map(|v| maps.crop_vec(v, big, FAR));
+    // Shape layers without a filled outline stroke their vector outline, estimated from local
+    // coverage; every other layer strokes its shape. The width then picks the field.
+    let vector_outline = vector_shape && !maps.outline;
     // Outside parts lie beneath the layer and blend onto the backdrop with their own mode. A
     // higher stroke covers the ones below it (Photoshop: a Multiply stroke listed above a wider
     // Normal stroke multiplies the backdrop, not the lower stroke). Each stroke's share is its
@@ -1946,7 +2071,14 @@ pub(crate) fn composite_with_effects_prepared(
             // Shape layers: Photoshop strokes the vector outline (estimated from local coverage
             // for unfilled shapes); the stroke never shows through the shape's pixels. Along a
             // filled shape's outline it covers the part of each edge pixel outside the path.
-            let d = vdout.as_ref().unwrap_or(&dout);
+            let exact = stroke_outside_exact(out_w);
+            let d: &[f32] = if vector_outline {
+                (if exact { vdout_exact.as_deref() } else { vdout.as_deref() }).unwrap_or_default()
+            } else if exact {
+                dout_exact.as_deref().unwrap_or_default()
+            } else {
+                dout.as_deref().unwrap_or_default()
+            };
             let mut share = vec![0.0f32; w * h];
             for (i, sh) in share.iter_mut().enumerate() {
                 let band = (out_w + 0.5 - d[i]).clamp(0.0, 1.0);
@@ -2005,8 +2137,7 @@ pub(crate) fn composite_with_effects_prepared(
     }
 
     // Layer (with interior effects) onto the exterior result, in the layer's mode.
-    let mode = if layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
-    let gamma = crate::text_gamma(layer);
+    let mode = if premerge || layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
     for (wp, lp) in work.px.iter_mut().zip(&lay.px) {
         if lp[3] > 0.0 {
             *wp = psblend::composite_gamma(mode, *wp, *lp, 1.0, gamma);
@@ -2111,15 +2242,23 @@ pub enum FieldKind {
     BevelOutside,
     /// `bevel_dist_inside` of the shape: the inside distance of chiselled bevels.
     BevelInside,
-    /// Chamfer distance outside the shape: outside strokes, and the spread of drop shadows and
-    /// softer outer glows ([`dilate`]).
+    /// Chamfer distance outside the shape: a narrow raster stroke's outer edge (see
+    /// [`stroke_outside_exact`]), and the spread of drop shadows and softer outer glows
+    /// ([`dilate`]); their metric is fitted to Photoshop (#224) and keeps the sub-pixel seeding.
     StrokeOutside,
     /// Chamfer distance outside `1 - alpha`: the choke of inner shadows and softer inner glows.
     ChokeInside,
     /// Stroke distance inside the shape.
     StrokeInside,
-    /// Stroke distance outside a shape layer's outline (from its local coverage).
+    /// Exact Euclidean distance outside the shape: a wide raster stroke's outer edge (see
+    /// [`stroke_outside_exact`]). The chamfer's level sets are polygons (an ~8-fold octagon), so a
+    /// wide stroke's outer boundary facets; the shadow / glow spread above keeps the chamfer (#3646).
+    StrokeOutsideExact,
+    /// Stroke distance outside a shape layer's outline (from its local coverage), exact Euclidean.
     StrokeOutsideVector,
+    /// Chamfer distance outside a shape layer's outline (from its local coverage): a narrow vector
+    /// stroke's outer edge, where the chamfer matches Photoshop (see [`STROKE_CHAMFER_MAX`]).
+    StrokeOutsideVectorChamfer,
 }
 
 /// The `kind` distance field of the shape `alpha` (row-major `w × h`). Values past `reach` pixels
@@ -2134,7 +2273,9 @@ pub fn distance_field(kind: FieldKind, alpha: Vec<f32>, w: usize, h: usize, reac
         FieldKind::StrokeOutside => dist_outside_by(&s, Metric::Chamfer),
         FieldKind::ChokeInside => dist_outside_by(&s.map(|a| 1.0 - a), Metric::Chamfer),
         FieldKind::StrokeInside => dist_inside_by(&s, Metric::Chamfer),
-        FieldKind::StrokeOutsideVector => dist_outside_by(&local_coverage(&s), Metric::Chamfer),
+        FieldKind::StrokeOutsideExact => dist_outside_by(&s, Metric::Euclidean),
+        FieldKind::StrokeOutsideVector => dist_outside_by(&local_coverage(&s), Metric::Euclidean),
+        FieldKind::StrokeOutsideVectorChamfer => dist_outside_by(&local_coverage(&s), Metric::Chamfer),
     }
 }
 
@@ -2338,6 +2479,40 @@ mod tests {
         // Nothing outside the shape; the ramp reaches about `size` inside.
         assert_eq!(at(&maps[0], 20, 8), 0.0);
         assert!(at(&maps[0], 20, 15) < 0.05);
+    }
+
+    /// Photoshop 27.11, measured across a straight edge (size 10, depth 100 %, light from the top
+    /// at 30°): a chisel facet has the slope `depth × size / (2 (size + 1))`, flat right up to the
+    /// edge pixel for Inner Hard; Inner Soft's edge pixel is half as steep again; Outer Hard
+    /// still shades, partly, the pixel where its ramp reaches zero `size + 1½` px out.
+    #[test]
+    fn chisel_facets_match_photoshop() {
+        let amount = |g: f32| {
+            let (se, ce) = 30f32.to_radians().sin_cos();
+            ((g * ce + se) / (1.0 + g * g).sqrt() - se) / (1.0 - se)
+        };
+        let n = 80;
+        let shape = square(n, 20, 60);
+        let maps = |style, technique| {
+            let mut b = bevel_of(style, technique);
+            b.size = 10.0;
+            bevel_maps(&shape, &b, &GlobalLight::default(), &no_tex(), &PreparedPatterns::new(&[], PREPARED_PATTERN_BYTES)).0
+        };
+        let at = |m: &Map, y: usize| m.v[y * n + 40];
+        let facet = amount(10.0 / 22.0);
+        let hard = maps(BevelStyle::InnerBevel, BevelTechnique::ChiselHard);
+        for y in 20..30 {
+            assert!((at(&hard[0], y) - facet).abs() < 0.01, "inner hard facet at row {y}: {} vs {facet}", at(&hard[0], y));
+        }
+        assert!(at(&hard[0], 30) > 0.05 && at(&hard[0], 30) < facet, "one partial pixel at the end");
+        let soft = maps(BevelStyle::InnerBevel, BevelTechnique::ChiselSoft);
+        assert!((at(&soft[0], 20) - amount(1.5 * 10.0 / 22.0)).abs() < 0.01, "steeper edge pixel: {}", at(&soft[0], 20));
+        assert!((at(&soft[0], 24) - facet).abs() < 0.01, "then Chisel Hard's facet");
+        let outer = maps(BevelStyle::OuterBevel, BevelTechnique::ChiselHard);
+        // Below the shape (rows 60..): shadow facet through 10½ px, partial at 11½.
+        assert!((at(&outer[1], 70) - at(&outer[1], 61)).abs() < 1e-4);
+        assert!(at(&outer[1], 71) > 0.05 && at(&outer[1], 71) < at(&outer[1], 70));
+        assert_eq!(at(&outer[1], 72), 0.0);
     }
 
     #[test]
@@ -2883,6 +3058,51 @@ mod tests {
         assert!(glow_lut(&g).is_none());
     }
 
+    /// Photoshop 27.11, measured on a 128 px square (Normal, black, 100 %, Range 50 %): a precise
+    /// glow's coverage across the edge, and a centre-source inner glow as 1 − the edge glow.
+    #[test]
+    fn glows_match_photoshop() {
+        let glow = |technique, size: f32, spread: f32, source| Glow {
+            common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0),
+            paint: FxPaint::Color(photocraft_color::Color::BLACK),
+            technique,
+            spread,
+            size,
+            contour: Contour::Linear,
+            anti_alias: false,
+            range: 0.5,
+            jitter: 0.0,
+            noise: 0.0,
+            source,
+        };
+        let n = 60;
+        let mut shape = Map::new(n, n, 0.0);
+        for y in 20..40 {
+            for x in 20..40 {
+                shape.v[y * n + x] = 1.0;
+            }
+        }
+        let at = |m: &Map, x: usize| m.v[30 * n + x];
+        // Outer, precise, size 10: Photoshop's black glow over white reads 47, 93, 140, 186, 232
+        // at 2, 4, 6, 8 and 10 px out from the edge pixel (alpha 1 − D / 11).
+        let m = glow_map(&shape, &glow(GlowTechnique::Precise, 10.0, 0.0, GlowSource::Edge), false, (0, 0));
+        for (d, ps) in [(2, 47.0f32), (4, 93.0), (6, 140.0), (8, 186.0), (10, 232.0)] {
+            let got = 255.0 * (1.0 - at(&m, 20 - d));
+            assert!((got - ps).abs() <= 1.5, "outer precise at {d} px: {got} vs Photoshop {ps}");
+        }
+        // Spread 40 %: solid for the first 4 px.
+        let m = glow_map(&shape, &glow(GlowTechnique::Precise, 10.0, 0.4, GlowSource::Edge), false, (0, 0));
+        assert!((at(&m, 16) - 1.0).abs() < 1e-6 && at(&m, 14) < 1.0);
+        // Centre source = 1 − edge, for both techniques.
+        for t in [GlowTechnique::Precise, GlowTechnique::Softer] {
+            let e = glow_map(&shape, &glow(t, 6.0, 0.0, GlowSource::Edge), true, (0, 0));
+            let c = glow_map(&shape, &glow(t, 6.0, 0.0, GlowSource::Center), true, (0, 0));
+            for x in 20..40 {
+                assert!((at(&c, x) - (1.0 - at(&e, x))).abs() < 1e-5, "{t:?} at {x}");
+            }
+        }
+    }
+
     #[test]
     fn offsets_follow_light() {
         let (dx, dy) = offset(120.0, 10.0);
@@ -2897,6 +3117,28 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn satin_at_distance_zero_matches_photoshop() {
+        // Photoshop 27.11, Satin black 100 %, angle 90°, Linear contour, distance 0, size 5 over a
+        // #808080 square: the rows from the top edge read 82, 102, 123, 128.
+        let s = photocraft_doc::effects::Satin {
+            common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0),
+            color: photocraft_color::Color::BLACK,
+            angle: 90.0,
+            distance: 0.0,
+            size: 5.0,
+            contour: Contour::Linear,
+            anti_alias: false,
+            invert: false,
+        };
+        let m = satin_map(&square_shape(60), &s);
+        for (row, gray) in [(5, 82.0), (7, 102.0), (9, 123.0), (11, 128.0), (30, 128.0)] {
+            let want = 1.0 - gray / 128.0;
+            let got = m.v[row * 60 + 30];
+            assert!((got - want).abs() < 0.02, "row {row}: {got} vs {want}");
+        }
     }
 
     fn shadow(noise: f32, origin: (i32, i32)) -> Map {
@@ -2959,5 +3201,14 @@ mod tests {
         let noisy = glow_map(&square_shape(40), &g(0.6), false, (0, 0));
         let diff: f32 = plain.v.iter().zip(&noisy.v).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 5.0, "glow noise changes the coverage: {diff}");
+    }
+
+    #[test]
+    fn shifting_by_hostile_distances_does_not_overflow() {
+        let m = square_shape(12);
+        for d in [1.0e30, -1.0e30, f32::INFINITY, f32::NAN] {
+            let s = m.shifted(d, d, 0.0);
+            assert_eq!(s.v.len(), 144);
+        }
     }
 }

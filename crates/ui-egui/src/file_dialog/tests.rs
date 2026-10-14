@@ -176,6 +176,30 @@ fn open_starts_in_the_last_used_folder() {
 }
 
 #[test]
+fn ask_folder_uses_the_async_dialog_and_returns_the_selected_path() {
+    let (mut app, open, _) = app();
+    let ctx = egui::Context::default();
+    app.ui.recent_files = vec!["/pics/cat.psd".into()];
+    let selected = Rc::new(RefCell::new(None));
+    let result = selected.clone();
+
+    assert_eq!(
+        app.ask_folder(move |_, path| {
+            *result.borrow_mut() = Some(path);
+            Ok(Value::Null)
+        })
+        .unwrap(),
+        json!({"fileDialog": "folder"})
+    );
+    app.poll_file_dialog(&ctx, None);
+    assert!(matches!(open.borrow().as_slice(), [(FileDialogRequest::Folder { initial_dir: Some(dir) }, _)] if dir == "/pics"));
+
+    answer(&open, Some(FileDialogAnswer::FolderTo("/pics/frames".into())));
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(selected.borrow().as_deref(), Some("/pics/frames"));
+}
+
+#[test]
 fn filtered_picker_requests_only_the_given_extensions() {
     let (mut app, open, _) = app();
     app.pick_file_bytes_filtered(&["cube", "3dl", "look"], |_, _, _| Ok(Value::Null)).unwrap();
@@ -264,6 +288,26 @@ fn save_paths_get_a_lowercase_extension_when_the_preference_is_on() {
     answer(&open, Some(FileDialogAnswer::SaveTo("/pics/CAT.PSD".into())));
     app.poll_file_dialog(&ctx, None);
     assert_eq!(*written.borrow(), ["/pics/CAT.PSD"], "off keeps the user's spelling");
+}
+
+/// #5039: a name typed without an extension (where file extensions are hidden) gets the
+/// suggested file's extension, so the save picks its format instead of failing.
+#[test]
+fn save_paths_without_an_extension_get_the_suggested_one() {
+    let (mut app, open, written) = app();
+    let ctx = egui::Context::default();
+    menus::invoke(&mut app, &ctx, "file.saveAs", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::SaveTo("/pics/cat".into())));
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(*written.borrow(), ["/pics/cat.psd"]);
+    assert_eq!(app.session.active().unwrap().path.as_deref(), Some("/pics/cat.psd"));
+    // A name that already has an extension is left alone.
+    menus::invoke(&mut app, &ctx, "file.saveAs", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::SaveTo("/pics/dog.png".into())));
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(*written.borrow(), ["/pics/cat.psd", "/pics/dog.png"]);
 }
 
 #[test]
@@ -660,4 +704,93 @@ fn an_unavailable_dialog_is_reported_and_a_cancelled_one_is_not() {
     assert!(app.ui.status_error);
     assert_eq!(app.ui.status, "No file dialog can open");
     assert!(!app.file_dialog_open(), "the pending dialog is over");
+}
+
+/// #3629: Layer › Export As with several artboards selected exports one file per board, at each
+/// board's size and with the dialog's settings, after one destination prompt.
+#[test]
+fn export_as_with_several_artboards_selected_writes_one_file_each() {
+    let (mut app, open, written) = app();
+    let a = app.run("layer.new.artboard", json!({"rect": [0, 0, 40, 30], "name": "Header"})).unwrap()["layer"].as_u64().unwrap();
+    let b = app.run("layer.new.artboard", json!({"rect": [60, 0, 20, 50], "name": "Capsule"})).unwrap()["layer"].as_u64().unwrap();
+    app.run("layer.select", json!({"layer": a})).unwrap();
+    app.run("layer.select", json!({"layer": b, "mode": "add"})).unwrap();
+    assert_eq!(app.session.active().unwrap().selected_layers().len(), 2);
+    let sizes = Rc::new(RefCell::new(Vec::new()));
+    let capture = sizes.clone();
+    app.services.export = Some(Box::new(move |doc: &photocraft_doc::Document, _: &str, _: &crate::ExportSettings| {
+        capture.borrow_mut().push((doc.name.clone(), doc.size.width, doc.size.height));
+        Ok((b"out".to_vec(), Vec::new()))
+    }));
+    assert!(!crate::layer_menu_ui::single_layer_only("layer.exportAs"), "the menu offers it for a selection");
+    let ctx = egui::Context::default();
+    let r = menus::invoke(&mut app, &ctx, "layer.exportAs", Value::Null).unwrap();
+    let id = r["dialog"].as_u64().unwrap();
+    let mut fields = app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields.clone();
+    assert_eq!(fields["__label"], "Export As: 2 layers");
+    // The dialog's settings apply to every file: JPG at 50 %.
+    fields.insert("format".into(), json!("jpg"));
+    fields.insert("scale".into(), json!(50));
+    crate::export_dialog::confirm(&mut app, &fields).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(open.borrow().len(), 1, "one destination for every board");
+    answer(&open, Some(FileDialogAnswer::SaveTo("/out/boards.jpg".into())));
+    app.poll_file_dialog(&ctx, None);
+    assert!(!app.ui.status_error, "{}", app.ui.status);
+    assert_eq!(written.borrow().len(), 2);
+    assert_eq!(written.borrow()[0], "/out/boards.jpg");
+    // The sibling path is built with `Path::join`, so Windows turns the separator into `\`.
+    let second = written.borrow()[1].replace('\\', "/");
+    assert!(second.starts_with("/out/boards-2-") && second.ends_with(".jpg"), "{:?}", written.borrow());
+    let mut got = sizes.borrow().iter().map(|(_, w, h)| (*w, *h)).collect::<Vec<_>>();
+    got.sort_unstable();
+    assert_eq!(got, [(10, 25), (20, 15)], "each board at its own size, scaled to 50 %");
+}
+
+/// #3806: File › Save on an OpenRaster file that can't hold the document (here an adjustment
+/// layer) doesn't overwrite it: Save As opens on a PSD with a notice saying what the .ora would
+/// drop, and the PSD becomes the document's file. A plain document still saves back to its .ora.
+#[test]
+fn openraster_save_never_overwrites_what_it_cannot_hold() {
+    let (mut app, open, written) = app();
+    app.run("layer.new.layer", json!({})).unwrap();
+    app.session.active_mut().unwrap().path = Some("/pics/art.ora".into());
+    let ctx = egui::Context::default();
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    assert_eq!(*written.borrow(), ["/pics/art.ora"], "a plain document saves in place");
+    app.run("layer.newAdjustmentLayer.invert", json!({})).unwrap();
+    let notices = app.ui.notices.len();
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(written.borrow().len(), 1, "the .ora is not overwritten");
+    assert!(matches!(open.borrow().as_slice(), [(FileDialogRequest::Save { suggested }, _)] if suggested == "/pics/art.psd"), "Save As offers PSD");
+    assert_eq!(app.ui.notices.len(), notices + 1);
+    assert!(app.ui.notices.last().unwrap().lines.iter().any(|l| l.contains("adjustment layers")), "{:?}", app.ui.notices.last().unwrap().lines);
+    assert!(app.session.active().unwrap().is_dirty(), "the edits are still unsaved");
+    answer(&open, Some(FileDialogAnswer::SaveTo("/pics/art.psd".into())));
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(written.borrow().last().map(String::as_str), Some("/pics/art.psd"));
+    let st = app.session.active().unwrap();
+    assert_eq!(st.path.as_deref(), Some("/pics/art.psd"));
+    assert!(!st.is_dirty());
+}
+
+/// Save As to OpenRaster of a document it can't hold writes a copy, as Photoshop does for formats
+/// that can't keep everything: the document keeps its file and its unsaved state. An automation
+/// save without a path won't overwrite such an .ora either.
+#[test]
+fn save_as_openraster_of_what_it_cannot_hold_is_a_copy() {
+    let (mut app, _open, written) = app();
+    app.run("layer.newAdjustmentLayer.invert", json!({})).unwrap();
+    app.session.active_mut().unwrap().path = Some("/pics/art.psd".into());
+    let ctx = egui::Context::default();
+    menus::invoke(&mut app, &ctx, "file.saveAs", json!({"path": "/pics/copy.ora"})).unwrap();
+    assert_eq!(*written.borrow(), ["/pics/copy.ora"]);
+    let st = app.session.active().unwrap();
+    assert_eq!(st.path.as_deref(), Some("/pics/art.psd"), "the document keeps its file");
+    assert!(st.is_dirty());
+    app.session.active_mut().unwrap().path = Some("/pics/art.ora".into());
+    let err = app.save_automation(None).unwrap_err();
+    assert!(err.contains("OpenRaster"), "{err}");
+    assert_eq!(written.borrow().len(), 1);
 }

@@ -90,7 +90,7 @@ impl PreviewTextures {
     }
 
     /// Level `n` of the mip chain (built on demand by 2×2 box filtering) and its uv extent.
-    fn level_image(&self, n: u32) -> Option<(Arc<ColorImage>, [f32; 2])> {
+    pub(crate) fn level_image(&self, n: u32) -> Option<(Arc<ColorImage>, [f32; 2])> {
         let mut imgs = self.images.lock().unwrap_or_else(PoisonError::into_inner);
         while imgs.len() <= n as usize {
             let prev = imgs.last()?;

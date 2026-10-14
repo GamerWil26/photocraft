@@ -8,7 +8,8 @@
 //! - `select.drop` drops the piece into its layer and moves the selection with it, as one history
 //!   step.
 //! - Any other command drops the piece first (so it lands exactly where it was shown), except Undo,
-//!   which puts it back where it was cut (nothing was changed yet).
+//!   which puts it back where it was cut (nothing was changed yet), and `history.selectState`,
+//!   which puts it back and then returns to the chosen state.
 //!
 //! While floating, the document is unchanged; [`displayed`] gives the document with the piece at
 //! its offset, for the canvas. The selection stays where it was until the drop.
@@ -58,7 +59,7 @@ impl CutParts {
         // A mask has no alpha: it keeps its format, and the cut leaves background colour.
         let mut rest = if mask { surf.clone() } else { full.clone() };
         let mut piece = Surface::new(with_alpha);
-        let fill = !copy && (mask || crate::extra_cmds::is_background(l));
+        let fill = !copy && (mask || doc.is_background(layer));
         // A mask's untouched pixels (its default, e.g. white) move too, so take the whole canvas.
         let b = sel.content_bounds().intersect(&if mask { doc.bounds() } else { surf.content_bounds() });
         if !b.is_empty() {
@@ -165,7 +166,7 @@ fn can_float(s: &Session) -> std::result::Result<(), String> {
 /// floating? The Background is position-locked, but its selected pixels move (Photoshop).
 pub fn locked_for_float(doc: &Document, l: &photocraft_doc::Layer) -> bool {
     let locks = doc.effective_locks(l.id);
-    locks.all || (locks.position && !crate::extra_cmds::is_background(l))
+    locks.all || (locks.position && !doc.is_background(l.id))
 }
 
 fn float(s: &mut Session, p: &Value) -> Result<Value> {
@@ -220,6 +221,13 @@ pub(crate) fn before_command(s: &mut Session, id: &str) -> Result<Option<Value>>
         "edit.undo" | "edit.stepBackward" => {
             st.floating = None;
             Ok(Some(json!({"floating": "returned"})))
+        }
+        // Returning to a History state puts the piece back too (it never reached the document),
+        // and then moves the history: dropping it first would add a step and discard the redo
+        // states the jump may be heading for.
+        "history.selectState" => {
+            st.floating = None;
+            Ok(None)
         }
         _ if keeps_floating(id) => Ok(None),
         _ => drop_floating(s).map(|_| None),

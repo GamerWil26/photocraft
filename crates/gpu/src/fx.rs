@@ -236,6 +236,19 @@ impl B {
     fn finish(&mut self, a: In, b: Option<In>, invert: bool, contour: &Contour, times_shape: bool, out: usize) {
         self.finish_lut(a, b, invert, contour_lut(contour), times_shape, out);
     }
+    /// A glow's last step: its contour over the Range, then (centre-source inner glows) the
+    /// inverse, then × the shape when inner.
+    fn finish_glow(&mut self, a: In, lut: Option<Vec<f32>>, inner: bool, center: bool) {
+        let mut s =
+            stage(Kernel::MFinish, Some(a), None, [0.0, if center { 2.0 } else { 0.0 }, f32::from(u8::from(lut.is_some())), f32::from(u8::from(inner))], 0);
+        s.lut = lut.map(Arc::new);
+        if inner {
+            s.s = Some(In::Shape);
+        }
+        s.out = Some(0);
+        self.stages.push(s);
+    }
+
     fn finish_lut(&mut self, a: In, b: Option<In>, invert: bool, lut: Option<Vec<f32>>, times_shape: bool, out: usize) {
         let flag = |v: bool| f32::from(u8::from(v));
         let mut s = stage(Kernel::MFinish, Some(a), b, [flag(b.is_some()), flag(invert), flag(lut.is_some()), flag(times_shape)], 0);
@@ -319,9 +332,9 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
                 GlowTechnique::Precise => {
                     let d = b.field(if inner { FieldKind::Inside } else { FieldKind::Outside }, g.size);
                     let solid = g.size * g.spread;
-                    let soft = (g.size - solid).max(1e-3);
-                    let m = b.push(stage(Kernel::MGlow, Some(d), None, [solid, soft, f32::from(u8::from(center)), 0.0], 0));
-                    b.finish_lut(m, None, false, photocraft_compose::effects::glow_lut(g), inner, 0);
+                    let soft = (g.size + 1.0 - solid).max(1e-3);
+                    let m = b.push(stage(Kernel::MGlow, Some(d), None, [solid, soft, 0.0, 0.0], 0));
+                    b.finish_glow(m, photocraft_compose::effects::glow_lut(g), inner, center);
                 }
                 GlowTechnique::Softer => {
                     // Inner glows (edge, and centre as 1 - the edge result) spread 1 - alpha.
@@ -333,19 +346,19 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
                         m = b.dilate(src, d, r);
                     }
                     let m = b.blur(m, bw);
-                    b.finish_lut(m, None, center, photocraft_compose::effects::glow_lut(g), inner, 0);
+                    b.finish_glow(m, photocraft_compose::effects::glow_lut(g), inner, center);
                 }
             }
             1
         }
         Effect::Satin(s) => {
             // satin_map
-            let (dx, dy) = offset(s.angle, s.distance);
+            let (dx, dy) = offset(s.angle, photocraft_compose::effects::satin_distance(s));
             let a = b.shift(In::Shape, dx, dy, 0.0, false);
             let a = b.conv(a, photocraft_compose::effects::tent_kernel(s.size));
             let c = b.shift(In::Shape, -dx, -dy, 0.0, false);
             let c = b.conv(c, photocraft_compose::effects::tent_kernel(s.size));
-            b.finish(a, Some(c), s.invert, &s.contour, true, 0);
+            b.finish_lut(a, Some(c), s.invert, photocraft_compose::effects::satin_lut(&s.contour), true, 0);
             1
         }
         Effect::BevelEmboss(bv) => {
@@ -363,8 +376,10 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
             } else {
                 let din = b.field(FieldKind::BevelInside, size);
                 let dout = b.field(FieldKind::BevelOutside, size);
-                let h = b.push(stage(Kernel::MBevelH, Some(din), Some(dout), [paint(g.paint), size, 0.0, 0.0], 0));
-                if g.chisel_soft > 0.0 { b.conv(h, photocraft_compose::effects::tent_kernel(g.chisel_soft)) } else { h }
+                let soft = g.chisel_soft > 0.0;
+                let h = b.push(stage(Kernel::MBevelH, Some(din), Some(dout), [paint(g.paint), size, f32::from(u8::from(soft)), 0.0], 0));
+                // As `effects::bevel_height`: only emboss styles blur a Chisel Soft ramp.
+                if soft && g.paint == BevelPaint::Both { b.conv(h, photocraft_compose::effects::tent_kernel(g.chisel_soft)) } else { h }
             };
             if let Some(c) = &bv.contour {
                 // Contour element: the height through the contour (`bevel_contour_lut`).
@@ -374,7 +389,7 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
                 h = b.push(st);
             }
             if let Some(t) = &bv.texture
-                && let Some(pat) = photocraft_doc::pattern::find(patterns, &t.id, &t.name).filter(|p| !p.is_empty())
+                && let Some(pat) = photocraft_doc::pattern::find(patterns, &t.id, &t.name).filter(|p| p.is_paintable())
             {
                 // Texture element (`effects::bevel_height`): luminance × depth / unit added.
                 let unit = if bv.depth.abs() > 1e-6 { (g.depth / bv.depth).abs().max(1e-3) } else { g.width.max(1.0) };
@@ -405,6 +420,7 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
                 for which in [0.0, 1.0] {
                     let mut s = stage(Kernel::MBevelShade, Some(h), None, [ca * ce, -sa * ce, se, se], 1);
                     s.p1 = [*depth, *region, which, f32::from(u8::from(lut.is_some()))];
+                    s.p3 = [f32::from(u8::from(g.paint == BevelPaint::Outer && bv.technique != BevelTechnique::Smooth)), 0.0, 0.0, 0.0];
                     s.lut = lut.clone();
                     s.s = Some(In::Shape);
                     s.out = Some(out);
@@ -418,7 +434,15 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
             // composite_with_effects' stroke bands (maps 0 outside, 1 inside)
             let (in_w, out_w) = stroke_widths(st);
             if out_w > 0.0 {
-                let d = b.field(if vector_shape { FieldKind::StrokeOutsideVector } else { FieldKind::StrokeOutside }, out_w);
+                // Narrow strokes keep the fitted chamfer, wide ones the exact transform (#3646);
+                // the CPU picks the same field by the same width (`stroke_outside_exact`).
+                let kind = match (vector_shape, photocraft_compose::effects::stroke_outside_exact(out_w)) {
+                    (true, true) => FieldKind::StrokeOutsideVector,
+                    (true, false) => FieldKind::StrokeOutsideVectorChamfer,
+                    (false, true) => FieldKind::StrokeOutsideExact,
+                    (false, false) => FieldKind::StrokeOutside,
+                };
+                let d = b.field(kind, out_w);
                 let mut s = stage(Kernel::MStroke, Some(d), None, [out_w, 0.0, 0.0, 0.0], 0);
                 s.out = Some(0);
                 b.stages.push(s);
@@ -506,7 +530,8 @@ pub(crate) fn field(kind: FieldKind, reach: i32, shape: &[f32], region: Rect, ou
 /// (the chamfer fields, a sequential sweep) the window is cut into bands that go in parallel. Without
 /// threads (wasm) there is nothing to spread over, and bands keep the memory small.
 fn threaded_inside(kind: FieldKind) -> bool {
-    !cfg!(target_arch = "wasm32") && matches!(kind, FieldKind::Outside | FieldKind::Inside | FieldKind::BevelOutside | FieldKind::BevelInside)
+    !cfg!(target_arch = "wasm32")
+        && matches!(kind, FieldKind::Outside | FieldKind::Inside | FieldKind::BevelOutside | FieldKind::BevelInside | FieldKind::StrokeOutsideExact)
 }
 
 /// [`field`] with the halo given (the tests shrink it to see that they notice).
@@ -732,7 +757,9 @@ mod tests {
             FieldKind::ChokeInside,
             FieldKind::StrokeOutside,
             FieldKind::StrokeInside,
+            FieldKind::StrokeOutsideExact,
             FieldKind::StrokeOutsideVector,
+            FieldKind::StrokeOutsideVectorChamfer,
         ] {
             let reach = 9;
             let whole = photocraft_compose::effects::distance_field(kind, shape.clone(), w, h, reach as f32);
@@ -808,5 +835,43 @@ mod tests {
             }
         }
         assert!(too_small_noticed, "a 2 row halo went unnoticed, so this test guards nothing");
+    }
+
+    /// #3646: a stroke's outer edge is the fitted 5 × 5 chamfer while it is narrow and the exact
+    /// Euclidean transform once it is wide — the chamfer's octagon facets a wide stroke. The GPU
+    /// builds it from the field its width picks (`stroke_outside_exact`), while the spread of drop
+    /// shadows and softer outer glows keeps the chamfer field (fitted to Photoshop, #224) — so
+    /// routing a wide stroke through the chamfer, or a shadow through the exact field, fails here.
+    #[test]
+    fn a_stroke_uses_the_chamfer_narrow_and_the_exact_field_wide() {
+        use photocraft_color::{BlendMode, Color};
+        use photocraft_doc::{FxCommon, FxPaint, StrokeFx, StrokePosition};
+        let light = GlobalLight::default();
+        let stroke =
+            |size, position| Effect::Stroke(StrokeFx { common: FxCommon::new(BlendMode::Normal, 1.0), size, position, paint: FxPaint::Color(Color::BLACK) });
+        // Narrow (< STROKE_CHAMFER_MAX): the chamfer, exactly as before #3646.
+        let narrow = program(&stroke(6.0, StrokePosition::Outside), &light, false);
+        assert!(narrow.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutside), "a narrow raster outside stroke keeps the chamfer: {:?}", narrow.fields);
+        assert!(!narrow.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutsideExact), "…not the exact field: {:?}", narrow.fields);
+        // Wide: the exact transform.
+        let wide = program(&stroke(40.0, StrokePosition::Outside), &light, false);
+        assert!(
+            wide.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutsideExact),
+            "a wide raster outside stroke needs the exact outer field: {:?}",
+            wide.fields
+        );
+        assert!(!wide.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutside), "…not the chamfer field: {:?}", wide.fields);
+        // A shape layer's outline stroke follows the same width rule; the inside edge keeps the chamfer.
+        let vector_narrow = program(&stroke(6.0, StrokePosition::Outside), &light, true);
+        assert!(vector_narrow.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutsideVectorChamfer), "{:?}", vector_narrow.fields);
+        let vector_wide = program(&stroke(40.0, StrokePosition::Outside), &light, true);
+        assert!(vector_wide.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutsideVector), "{:?}", vector_wide.fields);
+        let inner = program(&stroke(40.0, StrokePosition::Inside), &light, false);
+        assert!(inner.fields.iter().any(|(k, _)| *k == FieldKind::StrokeInside), "{:?}", inner.fields);
+        // The shadow / softer-glow spread is unchanged: still the chamfer.
+        let Effect::DropShadow(mut s) = Effect::default_drop_shadow() else { unreachable!() };
+        s.spread = 0.5;
+        let shadow = program(&Effect::DropShadow(s), &light, false);
+        assert!(shadow.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutside), "the shadow spread keeps the chamfer: {:?}", shadow.fields);
     }
 }

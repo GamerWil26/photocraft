@@ -268,8 +268,12 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "pattern.import";
-    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "missing `path` (.pat file)"))?;
-    let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    // A file on disk, or its bytes (a dropped file, the web build).
+    let bytes = match (p.get("path").and_then(Value::as_str), p.get("data").and_then(Value::as_str)) {
+        (Some(path), _) => std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?,
+        (None, Some(b64)) => photocraft_paint::tile::b64_decode(b64).ok_or_else(|| bad(cmd, "`data` is not base64"))?,
+        (None, None) => return Err(bad(cmd, "missing `path` (.pat file) or `data`")),
+    };
     let pats = photocraft_io::pattern_map::read_pat(&bytes).map_err(EngineError::Other)?;
     let mut ids = Vec::new();
     for pat in pats {
@@ -279,7 +283,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
             None => s.patterns.items.push(pat),
         }
     }
-    Ok(json!({"imported": ids}))
+    Ok(json!({"imported": ids, "count": ids.len()}))
 }
 
 fn export(s: &mut Session, p: &Value) -> Result<Value> {
@@ -326,8 +330,12 @@ fn new_fill_layer(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn brush_texture(s: &mut Session, p: &Value) -> Result<Value> {
     let pat = resolve_param(s, "brush.texturePattern", p)?;
+    let n = pat.is_paintable().then(|| usize::try_from(pat.pixel_count()).ok()).flatten();
+    let Some(n) = n else {
+        return Err(bad("brush.texturePattern", "the pattern is empty or too large to paint"));
+    };
     // Brush textures are grey: luminance of the composite over white.
-    let mut px = vec![[0.0f32; 4]; (pat.width * pat.height) as usize];
+    let mut px = vec![[0.0f32; 4]; n];
     pat.surface.read_rgba_into(pat.rect(), &mut px);
     let lum: Vec<f32> = px
         .iter()
@@ -348,8 +356,11 @@ fn brush_texture(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// A swatch colour for UIs (average of the tile), straight RGB.
 pub fn average_color(p: &Pattern) -> Color {
-    let mut px = vec![[0.0f32; 4]; (p.width * p.height) as usize];
-    p.surface.read_rgba_into(p.rect(), &mut px);
+    // A pattern too large to paint is averaged over its paintable top-left corner.
+    let side = photocraft_doc::pattern::MAX_PAINT_PIXELS.isqrt() as u32;
+    let (w, h) = (p.width.min(side), p.height.min(side));
+    let mut px = vec![[0.0f32; 4]; w as usize * h as usize];
+    p.surface.read_rgba_into(Rect::new(0, 0, w as i32, h as i32), &mut px);
     let n = px.len().max(1) as f32;
     let s = px.iter().fold([0.0f32; 3], |a, q| [a[0] + q[0], a[1] + q[1], a[2] + q[2]]);
     Color::rgb(s[0] / n, s[1] / n, s[2] / n)
@@ -402,7 +413,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Import Patterns…",
             menu: &[],
             shortcut: None,
-            params: r##"{"path":".pat file"}"##,
+            params: r##"{"path":".pat file"?,"data":base64 bytes? (instead of a path)} → {imported:[ids],count}"##,
             enabled: always,
             journal: true,
             run: import,
@@ -493,8 +504,17 @@ mod tests {
         let v = s.execute("pattern.import", json!({"path": path})).unwrap();
         assert!(v["imported"].as_array().unwrap().iter().any(|x| x == id.as_str()));
         assert_eq!(resolve(&s, &id).unwrap().surface.read_region(Rect::new(0, 0, 5, 4)), pat.surface.read_region(Rect::new(0, 0, 5, 4)));
+        // The same file as bytes (a dropped file, the web build).
+        let bytes = std::fs::read(path).unwrap();
+        s.execute("pattern.delete", json!({"pattern": "Crimson"})).unwrap();
+        let v = s.execute("pattern.import", json!({"data": photocraft_paint::tile::b64_encode(&bytes)})).unwrap();
+        assert_eq!(v["count"], v["imported"].as_array().unwrap().len());
+        assert_eq!(resolve(&s, "Crimson").unwrap().id, id);
         std::fs::remove_dir_all(dir).ok();
         assert!(s.execute("pattern.import", json!({"path": "/nonexistent.pat"})).is_err());
+        for bad in [json!({}), json!({"data": "not base64!"}), json!({"data": "aGVsbG8="})] {
+            assert!(s.execute("pattern.import", bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -559,5 +579,15 @@ mod tests {
         s.execute("brush.texturePattern", json!({"pattern": "Dots", "scale": 50})).unwrap();
         assert!(s.tools.brush.texture.enabled);
         assert!(matches!(s.tools.brush.texture.pattern, photocraft_paint::Pattern::Tile(_)));
+    }
+
+    #[test]
+    fn a_pattern_too_large_to_paint_is_refused_not_allocated() {
+        // width × height overflows u32: this panicked (debug) or wrapped (release).
+        let mut s = session(8);
+        let huge = Pattern { id: "huge".into(), name: "Huge".into(), width: 65_536, height: 65_536, surface: Surface::new(PixelFormat::RGBA8) };
+        s.patterns.items.push(huge);
+        let e = s.execute("brush.texturePattern", json!({"pattern": "huge"})).unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
     }
 }

@@ -177,7 +177,7 @@ fn tilt_shift_depths_models_selection_and_tile_edges_match_reference() {
                                     None => Image::read(&surface, t.inflate(radius)),
                                 };
                                 let mut data = reference::tilt_shift(&src, t, &ctx, 17.0, (0.3, 0.7), 29.0, 0.07, 0.3);
-                                crate::mix_selection(&mut data, t, &selection, &src);
+                                crate::mix_selection(&mut data, t, &selection, &src, alpha);
                                 want.write_region(t, &data);
                             }
                         }

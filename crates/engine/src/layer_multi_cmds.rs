@@ -44,7 +44,7 @@ pub(crate) fn mask_targets(s: &Session, p: &serde_json::Value) -> Result<Vec<Lay
         return Ok(ids);
     }
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let ids: Vec<LayerId> = ids.into_iter().filter(|id| d.doc.layer(*id).is_some_and(|l| l.mask.is_none() && !crate::extra_cmds::is_background(l))).collect();
+    let ids: Vec<LayerId> = ids.into_iter().filter(|id| d.doc.layer(*id).is_some_and(|l| l.mask.is_none() && !d.doc.is_background(l.id))).collect();
     if ids.is_empty() {
         return Err(EngineError::Other("none of the selected layers can take a layer mask".into()));
     }
@@ -123,7 +123,7 @@ fn selection_target(s: &Session, p: &Value) -> Result<LayerId> {
         if p.get("occurrence").is_some() {
             return Err(bad("layer.select", "`occurrence` requires `name`"));
         }
-        return p.get("layer").and_then(Value::as_u64).map(LayerId).ok_or_else(|| bad("layer.select", "needs `layer` or `name`"));
+        return crate::commands::explicit_layer(s, p)?.ok_or_else(|| bad("layer.select", "needs `layer` or `name`"));
     };
     if p.get("layer").is_some() {
         return Err(bad("layer.select", "use either `layer` or `name`, not both"));
@@ -155,7 +155,7 @@ fn range_order(layers: &[Layer], include_collapsed: bool, out: &mut Vec<LayerId>
     }
 }
 
-/// `layer.select`: `{"layer": id, "mode": "replace|toggle|range|add"}`.
+/// `layer.select`: `{"layer": id, "mode": "replace|toggle|range|add|remove"}`.
 pub fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let id = selection_target(s, p)?;
     let mode = p.get("mode").and_then(Value::as_str).unwrap_or("replace");
@@ -186,6 +186,15 @@ pub fn select(s: &mut Session, p: &Value) -> Result<Value> {
                 set_selection(s, sel, Some(id), Some(id))?;
             }
         }
+        // Toggle's removing half: a layer that isn't selected stays unselected (Photoshop's
+        // `removeFromSelection`, recorded by actions).
+        "remove" => {
+            if sel.contains(&id) && sel.len() > 1 {
+                sel.retain(|x| *x != id);
+                let active = if st.active_layer == Some(id) { sel.last().copied() } else { st.active_layer };
+                set_selection(s, sel, active, active)?;
+            }
+        }
         "range" => {
             let anchor = st.layer_anchor.filter(|a| st.doc.layer(*a).is_some()).or(st.active_layer).unwrap_or(id);
             let mut order = Vec::new();
@@ -205,13 +214,9 @@ pub fn select(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"selected": selected(s).iter().map(|l| l.0).collect::<Vec<_>>()}))
 }
 
-pub(crate) fn is_locked_background(l: &Layer) -> bool {
-    l.name == "Background" && l.locks.transparency && matches!(l.content, LayerContent::Raster(_))
-}
-
 fn select_all_layers(s: &mut Session) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let ids: Vec<LayerId> = d.doc.walk().into_iter().filter(|(_, _, l)| !is_locked_background(l)).map(|(_, _, l)| l.id).collect();
+    let ids: Vec<LayerId> = d.doc.walk().into_iter().filter(|(_, _, l)| !d.doc.is_background(l.id)).map(|(_, _, l)| l.id).collect();
     if ids.is_empty() {
         return Err(EngineError::Other("there are no layers to select".into()));
     }
@@ -307,9 +312,9 @@ pub(crate) fn with_links(doc: &Document, ids: &[LayerId]) -> Vec<LayerId> {
 }
 
 /// Move layers by whole pixels the way the Move tool does: pixels, linked masks, type and
-/// vector content (shapes, linked vector masks) all move together.
-pub(crate) fn move_layers(doc: &mut Document, moves: &[(LayerId, i32, i32)]) -> Result<()> {
-    let snapshot = doc.clone();
+/// vector content (shapes, linked vector masks) all move together. `before` is `doc` as it was
+/// before any of the moves (the edit's starting document), read when type and shapes re-render.
+pub(crate) fn move_layers(doc: &mut Document, before: &Document, moves: &[(LayerId, i32, i32)]) -> Result<()> {
     for &(id, dx, dy) in moves {
         if dx == 0 && dy == 0 {
             continue;
@@ -319,34 +324,73 @@ pub(crate) fn move_layers(doc: &mut Document, moves: &[(LayerId, i32, i32)]) -> 
         if locks.position || locks.all {
             return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
         }
-        crate::commands::translate_layer(&snapshot, l, dx, dy);
-        crate::vector_cmds::translate_vectors(&snapshot, l, dx as f64, dy as f64);
+        crate::commands::translate_layer(before, l, dx, dy);
+        crate::vector_cmds::translate_vectors(before, l, dx as f64, dy as f64);
     }
     Ok(())
 }
 
+/// Does a move aimed at the layer mask (`"target":"mask"`) move `l`'s mask alone? Only an
+/// unlinked mask does (the chain off); a linked one moves with its layer, as in Photoshop.
+pub fn moves_mask_alone(l: &Layer) -> bool {
+    l.mask.as_ref().is_some_and(|m| !m.linked)
+}
+
 /// `layer.translate`: the explicit layer, or every selected layer, plus their linked layers.
+/// With `"target":"mask"` a layer whose mask is unlinked moves that mask alone.
 pub fn translate(s: &mut Session, p: &Value) -> Result<Value> {
-    let dx = int_i32("layer.translate", p, "dx")?.unwrap_or(0);
-    let dy = int_i32("layer.translate", p, "dy")?.unwrap_or(0);
+    let (dx, dy) = match p.get("units").and_then(Value::as_str) {
+        None | Some("px") => (int_i32("layer.translate", p, "dx")?.unwrap_or(0), int_i32("layer.translate", p, "dy")?.unwrap_or(0)),
+        // Points (1/72 in), as a Photoshop action records a nudge: whole pixels at this
+        // document's resolution.
+        Some("pt") => {
+            let dpi = s.active().map_or(72.0, |d| f64::from(d.doc.resolution_dpi));
+            let to_px = |key: &str| -> Result<i32> {
+                let pt = match p.get(key) {
+                    None => 0.0,
+                    Some(v) => v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| bad("layer.translate", format!("`{key}` must be a number")))?,
+                };
+                let px = (pt * dpi / 72.0).round();
+                if px.abs() > f64::from(i32::MAX) {
+                    return Err(bad("layer.translate", format!("`{key}` = {pt} pt is outside the 32-bit coordinate range")));
+                }
+                Ok(px as i32)
+            };
+            (to_px("dx")?, to_px("dy")?)
+        }
+        Some(other) => return Err(bad("layer.translate", format!("unknown units `{other}` (px|pt)"))),
+    };
     if dx == 0 && dy == 0 {
         return Ok(Value::Null);
     }
-    let roots = match p.get("layer").and_then(Value::as_u64) {
-        Some(id) => vec![LayerId(id)],
+    let roots = match crate::commands::explicit_layer(s, p)? {
+        Some(id) => vec![id],
         None => selected(s),
     };
     if roots.is_empty() {
         return Err(EngineError::Other("no active layer".into()));
     }
+    let mask_target = p.get("target").and_then(Value::as_str) == Some("mask");
     let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
     let ids = s.edit("Move", |doc, _| {
-        let ids = move_targets(doc, &roots);
-        if ids.is_empty() {
+        let (alone, rest): (Vec<LayerId>, Vec<LayerId>) = roots.iter().partition(|id| mask_target && doc.layer(**id).is_some_and(moves_mask_alone));
+        let mut ids = move_targets(doc, &rest);
+        if ids.is_empty() && alone.is_empty() {
             return Err(EngineError::NoLayer(roots[0]));
         }
         let moves: Vec<_> = ids.iter().map(|&id| (id, dx, dy)).collect();
-        move_layers(doc, &moves)?;
+        move_layers(doc, &before, &moves)?;
+        for id in alone {
+            let locks = doc.effective_locks(id);
+            let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+            if locks.position || locks.all {
+                return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
+            }
+            if let Some(m) = &mut l.mask {
+                m.surface = shift_surface(&m.surface, dx, dy);
+            }
+            ids.push(id);
+        }
         // A board moved past any canvas edge grows the canvas, as a new one does (#1531, #3070).
         if ids.iter().any(|id| doc.layer(*id).is_some_and(|l| l.artboard().is_some())) {
             crate::artboard_cmds::fit_canvas(doc);
@@ -368,12 +412,23 @@ pub fn move_targets(doc: &Document, roots: &[LayerId]) -> Vec<LayerId> {
 /// shift as they are instead of re-rendering (the commit re-renders them), so a drag frame costs
 /// copying the moving pixels only.
 pub fn moved(doc: &Document, ids: &[LayerId], dx: i32, dy: i32) -> Result<Document> {
+    moved_target(doc, ids, dx, dy, false)
+}
+
+/// [`moved`] for a drag aimed at the layer mask (`mask_target`): unlinked masks move alone.
+pub fn moved_target(doc: &Document, ids: &[LayerId], dx: i32, dy: i32, mask_target: bool) -> Result<Document> {
     let mut out = doc.clone();
     for &id in ids {
         let locks = doc.effective_locks(id);
         let l = out.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         if locks.position || locks.all {
             return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
+        }
+        if mask_target && moves_mask_alone(l) {
+            if let Some(m) = &mut l.mask {
+                m.surface = shift_surface(&m.surface, dx, dy);
+            }
+            continue;
         }
         shift_shown(doc, l, dx, dy);
     }
@@ -410,13 +465,20 @@ fn shift_shown(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
         LayerContent::Shape(sh) => {
             // The rendered shape is cut at the canvas: one that reaches past it renders again.
             let canvas = doc.bounds();
-            let inside = sh.cache.as_ref().is_some_and(|c| {
+            let was_inside = sh.cache.as_ref().is_some_and(|c| {
                 let b = photocraft_compose::bounds::content_bounds(c);
                 b.is_empty() || (b.x0 > canvas.x0 && b.y0 > canvas.y0 && b.x1 < canvas.x1 && b.y1 < canvas.y1)
             });
             crate::vector_cmds::transform_shape(sh, &a);
+            let stroke_pad = sh.stroke.as_ref().filter(|s| s.opacity > 0.0).map_or(0.0, |s| f64::from(s.width.ceil()));
+            let stays_inside = sh.path.control_bounds().is_some_and(|(x0, y0, x1, y1)| {
+                (x0 - stroke_pad) > canvas.x0 as f64
+                    && (y0 - stroke_pad) > canvas.y0 as f64
+                    && (x1 + stroke_pad) < canvas.x1 as f64
+                    && (y1 + stroke_pad) < canvas.y1 as f64
+            });
             match &mut sh.cache {
-                Some(c) if inside => *c = translate_surface(c, dx, dy),
+                Some(c) if was_inside && stays_inside => *c = translate_surface(c, dx, dy),
                 _ => crate::vector_cmds::refresh_shape(doc, sh),
             }
         }
@@ -619,6 +681,7 @@ fn doc_pixels_equal(a: &Document, b: &Document) -> bool {
         layers: _,
         channels,
         guides: _,
+        ruler_origin: _,
         selection: _,
         metadata: _,
         global_light,
@@ -639,6 +702,7 @@ fn doc_pixels_equal(a: &Document, b: &Document) -> bool {
         slices: _,
         variables: _,
         timeline: _,
+        file_encoding: _,
     } = a;
     *size == b.size
         && resolution_dpi.to_bits() == b.resolution_dpi.to_bits()
@@ -681,35 +745,31 @@ pub fn same_pixels(a: &Document, b: &Document) -> bool {
 }
 
 /// Pixels a single history step can have changed between `a` and `b` (the documents on either
-/// side of an undo or redo): the union of the change bounds of every layer whose pixels
-/// differ, so undoing a local edit recomposites only that area instead of the whole canvas.
-/// `None` (composite everything, as before) when the step touched anything the layer walk
-/// cannot bound: document-level fields the compositor reads (canvas size, mode, depth,
-/// profile, global light, patterns, channels, palettes), the layer structure (order,
-/// additions, removals, kind changes; adding or removing a layer that draws nothing, see
-/// [`inert_at`], is no change), layer properties that reach outside their own bounds
-/// (clipping, excluded channels — what `layer.setProps` already reports as unbounded), and
-/// video layers.
-pub fn step_damage(a: &Document, b: &Document) -> Option<Rect> {
-    damage_between(a, b, false)
-}
-
-/// [`step_damage`] for an edit from `before` to `after` that may also have added layers which
-/// change pixels only within their own bounds (see [`added_bounds`]), as Duplicate Layer does:
-/// each contributes its change bounds instead of making the whole canvas recomposite. Inserting a
-/// copy of a 12 MP layer used to recomposite every layer of the document (#2883, P8/P9 in
+/// side of an edit, its undo or its redo): the union of the change bounds of every layer whose
+/// pixels differ, so a local edit recomposites only that area instead of the whole canvas. A
+/// layer only one side has (a duplicate, a paste, a deleted layer) counts where it draws (see
+/// [`one_sided_bounds`]); one that draws nothing ([`inert_at`]) changes nothing. `None`
+/// (composite everything) when the step touched anything the layer walk cannot bound:
+/// document-level fields the compositor reads (canvas size, mode, depth, profile, global light,
+/// patterns, channels, palettes), layer order and kind changes, layers added or removed that
+/// reach outside their own bounds, layer properties that do (clipping, excluded channels —
+/// what `layer.setProps` already reports as unbounded), and video layers. Inserting a copy of a
+/// 12 MP layer used to recomposite every layer of the document (#2883, P8/P9 in
 /// `perf/budgets.toml`).
-pub(crate) fn insert_damage(before: &Document, after: &Document) -> Option<Rect> {
-    damage_between(before, after, true)
-}
-
-fn damage_between(a: &Document, b: &Document, bounded_additions: bool) -> Option<Rect> {
+pub fn step_damage(a: &Document, b: &Document) -> Option<Rect> {
     if !doc_pixels_equal(a, b) {
         return None;
     }
-    fn walk(xs: &[Layer], ys: &[Layer], a: &Document, b: &Document, added: bool, out: &mut Rect) -> bool {
-        // Pair the layers by id, stepping over layers only one side has when they draw nothing
-        // (a new empty layer or group, #1771): adding or deleting one changes no pixels.
+    fn walk(xs: &[Layer], ys: &[Layer], a: &Document, b: &Document, out: &mut Rect) -> bool {
+        // Pair the layers by id, stepping over layers only one side has: one that draws nothing
+        // changes no pixels (a new empty layer or group, #1771), any other only where it draws.
+        let one_sided = |layers: &[Layer], k: usize, canvas: Rect, out: &mut Rect| {
+            let Some(r) = one_sided_bounds(layers, k, canvas) else { return false };
+            if !r.is_empty() {
+                *out = if out.is_empty() { r } else { out.union(&r) };
+            }
+            true
+        };
         let (mut i, mut j) = (0, 0);
         loop {
             let (x, y) = match (xs.get(i), ys.get(j)) {
@@ -719,19 +779,25 @@ fn damage_between(a: &Document, b: &Document, bounded_additions: bool) -> Option
                     j += 1;
                     continue;
                 }
-                _ if added && ys.get(j).is_some_and(|y| xs.iter().all(|x| x.id != y.id)) => {
-                    // A layer only `b` has: bounded when it is self-contained.
-                    let Some(r) = added_bounds(ys, j, b.bounds()) else { return false };
-                    if !r.is_empty() {
-                        *out = if out.is_empty() { r } else { out.union(&r) };
-                    }
-                    j += 1;
-                    continue;
-                }
                 _ if inert_at(xs, i) => {
                     i += 1;
                     continue;
                 }
+                (_, Some(y)) if xs.iter().all(|x| x.id != y.id) => {
+                    if !one_sided(ys, j, b.bounds(), out) {
+                        return false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                (Some(x), _) if ys.iter().all(|y| y.id != x.id) => {
+                    if !one_sided(xs, i, a.bounds(), out) {
+                        return false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                // Both sides have the layer, in another order.
                 _ => return false,
             };
             i += 1;
@@ -753,7 +819,7 @@ fn damage_between(a: &Document, b: &Document, bounded_additions: bool) -> Option
             }
             match (x.children(), y.children()) {
                 (Some(xc), Some(yc)) => {
-                    if !walk(xc, yc, a, b, added, out) {
+                    if !walk(xc, yc, a, b, out) {
                         return false;
                     }
                 }
@@ -763,15 +829,15 @@ fn damage_between(a: &Document, b: &Document, bounded_additions: bool) -> Option
         }
     }
     let mut out = Rect::EMPTY;
-    if walk(&a.layers, &b.layers, a, b, bounded_additions, &mut out) { Some(out) } else { None }
+    if walk(&a.layers, &b.layers, a, b, &mut out) { Some(out) } else { None }
 }
 
-/// The pixels adding `layers[k]` can change, when that is bounded: its change bounds
+/// The pixels adding or removing `layers[k]` can change, when that is bounded: its change bounds
 /// (`photocraft_compose::change_bounds`: not for an adjustment, or a pass-through group holding
-/// one), provided it doesn't become the clipping base of clipped layers above it, and neither it
-/// nor anything inside it is a video layer or excludes channels (both reach outside the layer's
-/// bounds, see [`step_damage`]).
-fn added_bounds(layers: &[Layer], k: usize, canvas: Rect) -> Option<Rect> {
+/// one), provided it isn't the clipping base of clipped layers above it (they would change base),
+/// and neither it nor anything inside it is a video layer or excludes channels (both reach
+/// outside the layer's bounds, see [`step_damage`]).
+fn one_sided_bounds(layers: &[Layer], k: usize, canvas: Rect) -> Option<Rect> {
     fn contained(l: &Layer, depth: usize) -> bool {
         depth < 256 && l.video.is_none() && l.excluded_channels == 0 && l.children().is_none_or(|c| c.iter().all(|c| contained(c, depth + 1)))
     }
@@ -818,11 +884,12 @@ pub(crate) fn note_inert_insert(s: &mut Session, id: LayerId) {
     }
 }
 
-/// Report the pixels an edit from `before` that added layers changed ([`insert_damage`]), so
-/// the canvas recomposites only where the new layers draw instead of the whole document.
+/// Report the pixels an edit from `before` that added layers changed ([`step_damage`]), for
+/// commands made of more than one edit, so the canvas recomposites only where the new layers
+/// draw instead of the whole document.
 pub(crate) fn note_insert(s: &mut Session, before: &Document) {
     let Some(st) = s.active_mut() else { return };
-    st.last_damage = insert_damage(before, &st.doc);
+    st.last_damage = step_damage(before, &st.doc);
 }
 
 /// Content bounds used by Align/Distribute: the layer's pixels (type and shape layers use their
@@ -884,6 +951,7 @@ fn align(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
     let edge = Edge::parse(kind).ok_or_else(|| bad(&cmd, "unknown edge"))?;
     let sel = selected(s);
     let to = p.get("to").and_then(Value::as_str).unwrap_or("auto").to_string();
+    let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
     let moved = s.edit("Align", |doc, _| {
         let items = bounded_selection(doc, &sel);
         if items.is_empty() {
@@ -915,7 +983,7 @@ fn align(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
             })
             .collect();
         let moves = dedup_moves(doc, moves);
-        move_layers(doc, &moves)?;
+        move_layers(doc, &before, &moves)?;
         Ok(moves.iter().filter(|m| m.1 != 0 || m.2 != 0).count())
     })?;
     Ok(json!({"moved": moved}))
@@ -938,6 +1006,7 @@ fn dedup_moves(doc: &Document, moves: Vec<(LayerId, i32, i32)>) -> Vec<(LayerId,
 fn distribute(s: &mut Session, kind: &str) -> Result<Value> {
     let sel = selected(s);
     let kind = kind.to_string();
+    let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
     let moved = s.edit("Distribute", |doc, _| {
         let mut items = bounded_selection(doc, &sel);
         if items.len() < 3 {
@@ -977,7 +1046,7 @@ fn distribute(s: &mut Session, kind: &str) -> Result<Value> {
         }
         let moves: Vec<_> = moves.into_iter().flat_map(|(id, dx, dy)| with_links(doc, &[id]).into_iter().map(move |l| (l, dx, dy))).collect();
         let moves = dedup_moves(doc, moves);
-        move_layers(doc, &moves)?;
+        move_layers(doc, &before, &moves)?;
         Ok(moves.iter().filter(|m| m.1 != 0 || m.2 != 0).count())
     })?;
     Ok(json!({"moved": moved}))
@@ -1142,13 +1211,7 @@ fn lock_layers(s: &mut Session, p: &Value) -> Result<Value> {
         for id in &sel {
             let l = doc.layer_mut(*id).ok_or(EngineError::NoLayer(*id))?;
             for (k, v) in &given {
-                match *k {
-                    "transparency" => l.locks.transparency = *v,
-                    "pixels" => l.locks.pixels = *v,
-                    "position" => l.locks.position = *v,
-                    "artboard" => l.locks.artboard = *v,
-                    _ => l.locks.all = *v,
-                }
+                l.locks.set(k, *v);
             }
         }
         Ok(())
@@ -1199,8 +1262,8 @@ pub(crate) fn check_group_depth(doc: &Document, what: &str) -> Result<()> {
 /// Group Layers (⌘G) / Group from Layers: the explicit layer, or every selected layer, moves
 /// into a new group placed where the top-most of them was. Bottom-to-top order is preserved.
 pub fn group_layers(s: &mut Session, p: &Value) -> Result<Value> {
-    let ids = match p.get("layer").and_then(Value::as_u64) {
-        Some(id) => vec![LayerId(id)],
+    let ids = match crate::commands::explicit_layer(s, p)? {
+        Some(id) => vec![id],
         None => selected(s),
     };
     if ids.is_empty() {
@@ -1228,6 +1291,12 @@ pub fn group_layers(s: &mut Session, p: &Value) -> Result<Value> {
 fn merge_layers(s: &mut Session) -> Result<Value> {
     let sel = selected(s);
     if sel.len() < 2 {
+        // ⌘E on a lone group is Photoshop's Merge Group (#3832); on a layer, Merge Down.
+        if let Some(&id) = sel.first()
+            && s.active().and_then(|d| d.doc.layer(id)).is_some_and(|l| matches!(l.content, LayerContent::Group(_)))
+        {
+            return s.execute("layer.mergeGroup", json!({ "layer": id.0 }));
+        }
         return s.execute("layer.mergeDown", json!({}));
     }
     let mid = s.edit("Merge Layers", |doc, active| {
@@ -1485,6 +1554,95 @@ mod tests {
         s.active().unwrap().last_damage
     }
 
+    /// A Photoshop action's nudge in points moves whole pixels at the document's resolution:
+    /// 0.36 pt is 1 px at 200 ppi and 1.5 → 2 px at 300 ppi.
+    #[test]
+    fn translate_in_points_follows_the_resolution() {
+        for (res, moved) in [(200, 1), (300, 2), (72, 0)] {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width": 100, "height": 80, "resolution": res})).unwrap();
+            let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+            s.execute("layer.translate", json!({"dx": 0.36, "dy": -0.36, "units": "pt"})).unwrap();
+            assert_eq!(bounds(&s, a), Rect::new(10 + moved, 10 - moved, 20 + moved, 20 - moved), "{res} ppi");
+        }
+        let mut s = session(8);
+        rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        for bad in [json!({"dx": 1, "units": "in"}), json!({"dx": "x", "units": "pt"}), json!({"dx": 1e300, "units": "pt"})] {
+            assert!(s.execute("layer.translate", bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// `remove` deselects a selected layer, leaves an unselected one alone and never empties the
+    /// selection.
+    #[test]
+    fn select_remove_takes_a_layer_out_of_the_selection() {
+        let mut s = session(8);
+        let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        let b = rect_layer(&mut s, Rect::new(30, 10, 40, 20));
+        let c = rect_layer(&mut s, Rect::new(50, 10, 60, 20));
+        s.execute("layer.select", json!({"layer": a.0})).unwrap();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        s.execute("layer.select", json!({"layer": c.0, "mode": "remove"})).unwrap();
+        assert_eq!(sel(&s).len(), 2, "an unselected layer stays out");
+        s.execute("layer.select", json!({"layer": b.0, "mode": "remove"})).unwrap();
+        assert_eq!(sel(&s), vec![a]);
+        s.execute("layer.select", json!({"layer": a.0, "mode": "remove"})).unwrap();
+        assert_eq!(sel(&s), vec![a], "the last selected layer stays");
+    }
+
+    /// A mask with its chain off stays put while the layer moves; a linked one moves along.
+    #[test]
+    fn translate_leaves_an_unlinked_mask_in_place() {
+        for depth in [8, 16] {
+            let mut s = session(depth);
+            let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+            s.execute("layer.select", json!({"layer": a.0})).unwrap();
+            s.execute("layer.layerMask.hideAll", json!({})).unwrap();
+            s.edit("mask", |doc, _| {
+                doc.layer_mut(a).unwrap().mask.as_mut().unwrap().surface.fill_rect(Rect::new(12, 12, 18, 18), &[1.0]);
+                Ok(())
+            })
+            .unwrap();
+            let mval = |s: &Session, x, y| doc(s).layer(a).unwrap().mask.as_ref().unwrap().surface.sample_channel(x, y, 0);
+            s.execute("layer.layerMask.linked", json!({"linked": false})).unwrap();
+            s.execute("layer.translate", json!({"dx": 30, "dy": 0})).unwrap();
+            assert!(mval(&s, 14, 14) > 0.9, "{depth}-bit: unlinked mask stays");
+            assert!(mval(&s, 44, 14) < 0.1);
+            s.execute("edit.undo", json!({})).unwrap();
+            s.execute("layer.layerMask.linked", json!({"linked": true})).unwrap();
+            s.execute("layer.translate", json!({"dx": 30, "dy": 0})).unwrap();
+            assert!(mval(&s, 44, 14) > 0.9, "{depth}-bit: linked mask moves");
+        }
+    }
+
+    /// Aimed at the mask, a move shifts an unlinked mask alone and leaves a linked one with its layer.
+    #[test]
+    fn translate_with_the_mask_targeted_moves_an_unlinked_mask_alone() {
+        for depth in [8, 16] {
+            let mut s = session(depth);
+            let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+            s.execute("layer.select", json!({"layer": a.0})).unwrap();
+            s.execute("layer.layerMask.hideAll", json!({})).unwrap();
+            s.edit("mask", |doc, _| {
+                doc.layer_mut(a).unwrap().mask.as_mut().unwrap().surface.fill_rect(Rect::new(12, 12, 18, 18), &[1.0]);
+                Ok(())
+            })
+            .unwrap();
+            let mval = |s: &Session, x, y| doc(s).layer(a).unwrap().mask.as_ref().unwrap().surface.sample_channel(x, y, 0);
+            // Linked: the layer and its mask move together.
+            s.execute("layer.translate", json!({"dx": 30, "dy": 0, "target": "mask"})).unwrap();
+            assert_eq!(bounds(&s, a), Rect::new(40, 10, 50, 20), "{depth}-bit");
+            assert!(mval(&s, 44, 14) > 0.9);
+            s.execute("layer.layerMask.linked", json!({"linked": false})).unwrap();
+            s.execute("layer.translate", json!({"dx": -30, "dy": 0, "target": "mask"})).unwrap();
+            assert_eq!(bounds(&s, a), Rect::new(40, 10, 50, 20), "{depth}-bit: the layer stays");
+            assert!(mval(&s, 14, 14) > 0.9, "the mask moved");
+            assert!(mval(&s, 44, 14) < 0.1);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert!(mval(&s, 44, 14) > 0.9, "undo puts the mask back");
+        }
+    }
+
     #[test]
     fn moves_and_layer_props_report_only_their_area() {
         let mut s = session(8);
@@ -1549,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn new_layers_that_change_pixels_still_recomposite_everything() {
+    fn new_layers_that_change_clipping_recomposite_everything() {
         let mut s = session(8);
         let base = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
         let clipped = rect_layer(&mut s, Rect::new(0, 0, 100, 80));
@@ -1573,21 +1731,33 @@ mod tests {
         assert_eq!(step_damage(&before, &split), None);
         assert_eq!(step_damage(&split, &before), None);
         s.execute("edit.undo", json!({})).unwrap();
-        // A step that adds a layer with pixels (Layer via Copy, paste…) is not inert either.
+        // A step that adds a layer with pixels (Layer via Copy, paste…) changes where it draws.
         let before = doc(&s).clone();
         let mut after = before.clone();
         let mut l = Layer::raster("painted", after.pixel_format());
         l.surface_mut().unwrap().fill_rect(Rect::new(1, 1, 2, 2), &[0.0, 1.0, 0.0, 1.0]);
         after.insert_above(None, l);
-        assert_eq!(step_damage(&before, &after), None);
-        assert_eq!(step_damage(&after, &before), None);
-        // Nor, conservatively, an empty layer in another blend mode.
+        assert_eq!(step_damage(&before, &after), Some(Rect::new(1, 1, 2, 2)));
+        assert_eq!(step_damage(&after, &before), Some(Rect::new(1, 1, 2, 2)));
+        // Unless it becomes the base of clipped layers above it.
+        let mut based = before.clone();
+        let mut l = Layer::raster("base", based.pixel_format());
+        l.surface_mut().unwrap().fill_rect(Rect::new(1, 1, 2, 2), &[0.0, 1.0, 0.0, 1.0]);
+        let under = based.layers.iter().position(|l| l.id == clipped).unwrap();
+        based.layers.insert(under, l);
+        assert_eq!(step_damage(&before, &based), None);
+        assert_eq!(step_damage(&based, &before), None);
+        // An adjustment reaches every pixel below it.
+        let mut adjusted = before.clone();
+        adjusted.insert_above(None, Layer::new("inv", LayerContent::Adjustment(photocraft_doc::Adjustment::Invert)));
+        assert_eq!(step_damage(&before, &adjusted), None);
+        assert_eq!(step_damage(&adjusted, &before), None);
+        // Empty layers draw nothing, in any blend mode.
         let mut styled = before.clone();
         let mut l = Layer::raster("styled", styled.pixel_format());
         l.blend = photocraft_doc::BlendMode::Multiply;
         styled.insert_above(None, l);
-        assert_eq!(step_damage(&before, &styled), None);
-        // An empty layer in Normal mode is.
+        assert_eq!(step_damage(&before, &styled), Some(Rect::EMPTY));
         let mut plain = before.clone();
         plain.insert_above(None, Layer::raster("plain", plain.pixel_format()));
         assert_eq!(step_damage(&before, &plain), Some(Rect::EMPTY));
@@ -1630,6 +1800,40 @@ mod tests {
         }
     }
 
+    /// The composite of `after` equals `before`'s outside `damage`.
+    fn unchanged_outside(before: &Document, after: &Document, damage: Rect) -> bool {
+        let (x, y) = (photocraft_compose::render(before, before.bounds()), photocraft_compose::render(after, after.bounds()));
+        let w = before.bounds().width() as i32;
+        x.px.iter().zip(&y.px).enumerate().all(|(i, (p, q))| p == q || damage.contains(i as i32 % w, i as i32 / w))
+    }
+
+    /// Duplicate, paste and delete, and their undo and redo, recomposite only where the layer
+    /// draws; undoing a duplicate used to recomposite the whole document.
+    #[test]
+    fn duplicate_paste_and_delete_report_where_the_layer_draws() {
+        let mut s = session(8);
+        let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        let full = doc(&s).bounds();
+        let step = |s: &mut Session, id: &str, p: serde_json::Value| {
+            let before = doc(s).clone();
+            s.execute(id, p).unwrap();
+            let d = damage(s).unwrap_or_else(|| panic!("{id}: unbounded damage"));
+            assert!(d.width() < full.width(), "{id}: {d:?}");
+            assert!(unchanged_outside(&before, doc(s), d), "{id}: pixels changed outside {d:?}");
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(damage(s), Some(d), "undo {id}");
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(damage(s), Some(d), "redo {id}");
+        };
+        step(&mut s, "layer.duplicate", json!({"layer": a.0}));
+        s.execute("layer.select", json!({"layer": a.0})).unwrap();
+        s.execute("select.rect", json!({"x": 12, "y": 12, "width": 4, "height": 4})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("select.deselect", json!({})).unwrap();
+        step(&mut s, "edit.paste", json!({}));
+        step(&mut s, "layer.delete", json!({"layer": a.0}));
+    }
+
     #[test]
     fn the_move_preview_matches_the_move() {
         let mut s = session(8);
@@ -1644,6 +1848,42 @@ mod tests {
         locked.layer_mut(a).unwrap().locks.position = true;
         assert!(moved(&locked, &ids, 1, 1).is_err());
         assert!(moved(&before, &[LayerId(999_999)], 1, 1).is_err());
+    }
+
+    #[test]
+    fn move_stroked_shape_across_canvas_edge_matches_fresh_render() {
+        let mut s = session(8);
+        let id = LayerId(
+            s.execute("shape.create", json!({"kind": "rect", "rect": [10, 10, 30, 30], "stroke": {"width": 4, "color": "#ff0000"}})).unwrap()["layer"]
+                .as_u64()
+                .unwrap(),
+        );
+        let before = doc(&s).clone();
+        let ids = move_targets(&before, &[id]);
+
+        // Drag the stroked shape across the left canvas boundary:
+        let moved_doc = moved(&before, &ids, -25, 0).unwrap();
+        let moved_layer = moved_doc.layer(id).unwrap();
+        let LayerContent::Shape(sh) = &moved_layer.content else { panic!("not a shape") };
+        let cached = sh.cache.as_ref().expect("cached render");
+
+        let mut fresh_sh = sh.clone();
+        crate::vector_cmds::refresh_shape(&moved_doc, &mut fresh_sh);
+        let fresh = fresh_sh.cache.as_ref().expect("fresh render");
+
+        assert_eq!(cached, fresh, "dragged shape cached render must match fresh render across canvas edge");
+
+        // Drag it back inside the canvas:
+        let moved_back = moved(&moved_doc, &ids, 30, 0).unwrap();
+        let back_layer = moved_back.layer(id).unwrap();
+        let LayerContent::Shape(back_sh) = &back_layer.content else { panic!("not a shape") };
+        let back_cached = back_sh.cache.as_ref().expect("cached render");
+
+        let mut fresh_back = back_sh.clone();
+        crate::vector_cmds::refresh_shape(&moved_back, &mut fresh_back);
+        let fresh_back_render = fresh_back.cache.as_ref().expect("fresh render");
+
+        assert_eq!(back_cached, fresh_back_render, "cached render must match fresh render when dragged back");
     }
 
     fn select_all(s: &mut Session, ids: &[LayerId]) {
@@ -2166,12 +2406,12 @@ mod tests {
         assert_ne!(doc(&s).size, photocraft_doc::Size::new(100, 80));
         s.undo();
         assert_eq!(damage(&s), None, "a size change recomposites the whole canvas");
-        // A structural change (a layer removed and restored) neither.
+        // A layer removed and restored changes only where it draws.
         let b = rect_layer(&mut s, Rect::new(0, 0, 5, 5));
         select_all(&mut s, &[b]);
         s.execute("layer.delete", json!({})).unwrap();
         s.undo();
-        assert_eq!(damage(&s), None);
+        assert_eq!(damage(&s), Some(Rect::new(0, 0, 5, 5)));
     }
 
     #[test]
@@ -2401,6 +2641,31 @@ mod tests {
         s.execute("layer.arrange.reverse", json!({})).unwrap();
         assert_eq!(doc(&s).layers.iter().skip(1).map(|l| l.id).collect::<Vec<_>>(), vec![c, b, a]);
         assert_eq!(s.active().unwrap().history.entries().last().map(|e| e.as_str()), Some("Reverse"));
+    }
+
+    /// #4892: Lock Image Pixels includes Lock Transparent Pixels, so the two are never both on:
+    /// locking the pixels clears the transparency lock, which stays off while they are locked,
+    /// through both `layer.setProps` and `layer.lockLayers`.
+    #[test]
+    fn locking_pixels_clears_and_holds_off_the_transparency_lock() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+        let id = LayerId(s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap());
+        let locks = |s: &Session| doc(s).layer(id).unwrap().locks;
+        s.execute("layer.setProps", json!({"locks": {"transparency": true}})).unwrap();
+        assert!(locks(&s).transparency);
+        s.execute("layer.setProps", json!({"locks": {"pixels": true}})).unwrap();
+        assert!(locks(&s).pixels && !locks(&s).transparency, "locking the pixels clears the transparency lock");
+        s.execute("layer.setProps", json!({"locks": {"transparency": true}})).unwrap();
+        assert!(!locks(&s).transparency, "and it stays off while the pixels are locked");
+        s.execute("layer.setProps", json!({"locks": {"transparency": true, "pixels": true}})).unwrap();
+        assert!(locks(&s).pixels && !locks(&s).transparency, "both at once: the pixel lock wins");
+        s.execute("layer.lockLayers", json!({"pixels": false})).unwrap();
+        s.execute("layer.lockLayers", json!({"transparency": true})).unwrap();
+        assert!(locks(&s).transparency && !locks(&s).pixels, "with the pixels unlocked it can be set again");
+        s.execute("layer.lockLayers", json!({"pixels": true})).unwrap();
+        assert!(locks(&s).pixels && !locks(&s).transparency);
+        assert!(s.execute("layer.setProps", json!({"locks": {"nope": true}})).is_err());
     }
 
     #[test]

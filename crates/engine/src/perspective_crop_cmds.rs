@@ -14,7 +14,7 @@
 
 use photocraft_algo::transform::{Homography, Interp, convex_quad, quad_size, quad_to_rect, warp_surface_clipped};
 use photocraft_color::PixelFormat;
-use photocraft_doc::{Document, Layer, LayerContent, Size};
+use photocraft_doc::{Document, Layer, LayerContent, LayerId, Size};
 use photocraft_geom::{Affine, Rect};
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -154,12 +154,13 @@ fn warp_gray(s: &Surface, h: &Homography, interp: Interp, clip: Rect) -> Result<
 }
 
 /// Maps every layer's pixels and masks through `h` into `clip`.
-fn warp_layers(layers: &mut [Layer], h: &Homography, interp: Interp, clip: Rect, bg: &[f32]) -> Result<()> {
+/// `background_id` is the id of the document's Background, if it has one.
+fn warp_layers(layers: &mut [Layer], h: &Homography, interp: Interp, clip: Rect, bg: &[f32], background_id: Option<LayerId>) -> Result<()> {
     for l in layers {
         crate::allocation::checkpoint("a perspective crop")?;
-        let background = crate::extra_cmds::is_background(l);
+        let background = background_id == Some(l.id);
         match &mut l.content {
-            LayerContent::Group(g) => warp_layers(&mut g.children, h, interp, clip, bg)?,
+            LayerContent::Group(g) => warp_layers(&mut g.children, h, interp, clip, bg, None)?,
             LayerContent::Raster(surf) => {
                 let warped = warp_surface_clipped(surf, surf.content_bounds(), h, interp, clip)?;
                 *surf = if background {
@@ -188,7 +189,8 @@ fn apply(doc: &mut Document, q: &[[f64; 2]; 4], h: &Homography, size: (u32, u32)
     let (w, ht) = size;
     let clip = Rect::from_xywh(0, 0, w, ht);
     let bg = photocraft_raster::from_rgba(&doc.pixel_format(), bg);
-    warp_layers(&mut doc.layers, h, interp, clip, &bg)?;
+    let background_id = doc.background().map(|l| l.id);
+    warp_layers(&mut doc.layers, h, interp, clip, &bg, background_id)?;
     for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
         ch.surface = warp_gray(&ch.surface, h, interp, clip)?;
     }

@@ -227,3 +227,23 @@ fn thumbnail_selection_ctrl_click_layer_path_preserves_panel_target() {
         h.render().unwrap().save(path).unwrap();
     }
 }
+
+/// #3915: Clicking a shape with the Path Selection tool selects its layer.
+#[test]
+fn clicking_shape_with_path_selection_selects_its_layer() {
+    let mut h = harness();
+    let rect_layer =
+        h.state_mut().run("shape.create", json!({"kind": "rect", "rect": [20, 20, 80, 60], "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    // Add a new empty layer above so rect is not the active layer.
+    let empty_layer = h.state_mut().run("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap();
+    assert_eq!(h.state().session.active().unwrap().active_layer.unwrap().0, empty_layer);
+
+    // Clicking inside the rectangle with Path Selection selects the rect layer.
+    h.state_mut().ui.tool = Tool::PathSelection;
+    crate::vector_ui::path_selection_finish(h.state_mut(), [50.0, 50.0], [50.0, 50.0]);
+    assert_eq!(h.state().session.active().unwrap().active_layer.unwrap().0, rect_layer);
+
+    // Clicking outside does not change active layer.
+    crate::vector_ui::path_selection_finish(h.state_mut(), [150.0, 90.0], [150.0, 90.0]);
+    assert_eq!(h.state().session.active().unwrap().active_layer.unwrap().0, rect_layer);
+}

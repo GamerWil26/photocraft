@@ -46,6 +46,9 @@ pub struct DocM {
     pub layers: Vec<LayerM>,
     pub channels: Vec<ChannelM>,
     pub guides: Guides,
+    /// The rulers' zero point in document pixels (absent in older files: the top-left).
+    #[serde(default)]
+    pub ruler_origin: [f64; 2],
     pub selection: Option<SurfaceM>,
     pub metadata: MetadataM,
     pub global_light: GlobalLight,
@@ -84,6 +87,9 @@ pub struct DocM {
     /// Window › Timeline.
     #[serde(default)]
     pub timeline: Option<photocraft_doc::Timeline>,
+    /// The JPEG quality / WebP encoding File › Save reuses.
+    #[serde(default, skip_serializing_if = "photocraft_doc::FileEncoding::is_empty")]
+    pub file_encoding: photocraft_doc::FileEncoding,
     /// Image › Analysis: measurement scale, count groups, ruler.
     #[serde(default)]
     pub measurement: photocraft_doc::Measurement,

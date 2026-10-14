@@ -52,9 +52,21 @@ fn color(p: &Value, k: &str, d: [f32; 3]) -> Color {
     let c = color_of(p, k).map_or(d, |c| c.to_rgb());
     Color::rgb(c[0], c[1], c[2])
 }
+/// The stops of a two-colour gradient, baked with Photoshop's interpolation when `method` names
+/// one (`classic`, `perceptual`, `linear`, `smooth`; `smoothness` 0..=100, default 100 as in
+/// Photoshop): the compositors interpolate stops linearly, so the curve becomes dense stops, as on
+/// PSD import. Photoshop 27.11's Classic Gradient Overlay eases (t + smoothstep(t)) / 2 between the
+/// colours: a straight ramp was up to 12 levels off.
+fn gradient_stops(p: &Value, from: Color, to: Color) -> Vec<(f32, Color)> {
+    let stops = vec![(0.0, from), (1.0, to)];
+    match p.get("method").and_then(Value::as_str).and_then(photocraft_io::GradientMethod::from_name) {
+        Some(m) => photocraft_io::bake_gradient(stops, &[0.5], (f(p, "smoothness", 100.0) / 100.0).clamp(0.0, 1.0), m),
+        None => stops,
+    }
+}
 fn gradient(p: &Value) -> Gradient {
     Gradient {
-        stops: vec![(0.0, color(p, "from", [0.0; 3])), (1.0, color(p, "to", [1.0; 3]))],
+        stops: gradient_stops(p, color(p, "from", [0.0; 3]), color(p, "to", [1.0; 3])),
         style: gradient_style(p.get("style").and_then(Value::as_str).unwrap_or("linear")),
         angle: f(p, "angle", 90.0),
         scale: f(p, "scale", 100.0) / 100.0,
@@ -98,39 +110,250 @@ pub fn effect_defaults(kind: &str) -> Value {
 /// A contour preset point: input, output (both `0..=1`) and whether it is a corner.
 pub type ContourPoint = (f32, f32, bool);
 
-/// Built-in contour presets, in the order of Photoshop's default contour picker. The shapes are
-/// our own control points, drawn to match each preset's visible curve; imported PSD contours keep
-/// their own points. Points are sorted by input; a corner point bends the curve sharply.
+/// Built-in contour presets, in the order of Photoshop's default contour picker. Each is Photoshop's
+/// own curve as measured in Photoshop 27.11 (a Satin of each preset against a Linear one, 38
+/// levels per curve, read back through Satin's mirrored lookup — see
+/// `photocraft_compose::effects::satin_lut` — and thinned to within 1 %), joined by straight
+/// segments (every inner point a corner). Imported PSD contours keep their own points.
 pub const CONTOURS: &[(&str, &[ContourPoint])] = &[
     ("Linear", &[(0.0, 0.0, false), (1.0, 1.0, false)]),
-    ("Cone", &[(0.0, 0.0, false), (0.5, 1.0, true), (1.0, 0.0, false)]),
-    ("Cone - Inverted", &[(0.0, 1.0, false), (0.5, 0.0, true), (1.0, 1.0, false)]),
-    ("Cove - Deep", &[(0.0, 0.0, false), (0.3, 0.02, false), (0.6, 0.12, false), (0.85, 0.4, false), (1.0, 1.0, false)]),
-    ("Cove - Shallow", &[(0.0, 0.0, false), (0.5, 0.22, false), (1.0, 1.0, false)]),
-    ("Gaussian", &[(0.0, 0.0, false), (0.25, 0.08, false), (0.5, 0.5, false), (0.75, 0.92, false), (1.0, 1.0, false)]),
-    ("Half Round", &[(0.0, 0.0, false), (0.04, 0.28, false), (0.15, 0.53, false), (0.35, 0.8, false), (0.65, 0.95, false), (1.0, 1.0, false)]),
-    ("Ring", &[(0.0, 0.0, false), (0.25, 0.7, false), (0.5, 1.0, false), (0.75, 0.7, false), (1.0, 0.0, false)]),
-    ("Ring - Double", &[(0.0, 0.0, false), (0.25, 1.0, false), (0.5, 0.0, true), (0.75, 1.0, false), (1.0, 0.0, false)]),
-    ("Rolling Slope - Descending", &[(0.0, 1.0, false), (0.25, 0.62, false), (0.5, 0.58, false), (0.75, 0.28, false), (1.0, 0.0, false)]),
     (
-        "Rounded Steps",
+        "Cone",
         &[
             (0.0, 0.0, false),
-            (0.08, 0.01, false),
-            (0.165, 0.167, false),
-            (0.25, 0.323, false),
-            (0.333, 0.333, true),
-            (0.413, 0.343, false),
-            (0.5, 0.5, false),
-            (0.587, 0.657, false),
-            (0.667, 0.667, true),
-            (0.747, 0.677, false),
-            (0.833, 0.833, false),
-            (0.92, 0.99, false),
+            (0.172, 0.477, true),
+            (0.195, 0.555, true),
+            (0.266, 0.711, true),
+            (0.383, 0.922, true),
+            (0.43, 0.969, true),
+            (0.477, 0.992, true),
+            (0.523, 0.992, true),
+            (0.57, 0.969, true),
+            (0.664, 0.859, true),
+            (0.703, 0.789, true),
+            (0.742, 0.711, true),
+            (0.836, 0.477, true),
+            (0.859, 0.398, true),
+            (0.914, 0.266, true),
+            (0.945, 0.156, true),
+            (0.977, 0.078, true),
+            (1.0, 0.0, false),
+        ],
+    ),
+    (
+        "Cone - Inverted",
+        &[
+            (0.0, 1.0, false),
+            (0.031, 0.922, true),
+            (0.07, 0.789, true),
+            (0.172, 0.523, true),
+            (0.195, 0.445, true),
+            (0.266, 0.289, true),
+            (0.383, 0.078, true),
+            (0.43, 0.031, true),
+            (0.477, 0.008, true),
+            (0.523, 0.008, true),
+            (0.57, 0.031, true),
+            (0.664, 0.141, true),
+            (0.703, 0.211, true),
+            (0.742, 0.289, true),
+            (0.836, 0.523, true),
+            (0.859, 0.602, true),
+            (0.914, 0.734, true),
+            (0.945, 0.844, true),
+            (0.977, 0.922, true),
             (1.0, 1.0, false),
         ],
     ),
-    ("Sawtooth 1", &[(0.0, 0.0, false), (0.3, 1.0, true), (0.34, 0.0, true), (0.64, 1.0, true), (0.68, 0.0, true), (1.0, 1.0, false)]),
+    (
+        "Cove - Deep",
+        &[
+            (0.0, 0.258, false),
+            (0.344, 0.289, true),
+            (0.383, 0.297, true),
+            (0.477, 0.352, true),
+            (0.57, 0.43, true),
+            (0.617, 0.484, true),
+            (0.664, 0.57, true),
+            (0.703, 0.711, true),
+            (0.742, 0.906, true),
+            (0.773, 1.0, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Cove - Shallow",
+        &[
+            (0.0, 0.0, false),
+            (0.008, 0.164, true),
+            (0.016, 0.477, true),
+            (0.039, 0.508, true),
+            (0.172, 0.57, true),
+            (0.305, 0.688, true),
+            (0.344, 0.734, true),
+            (0.477, 0.945, true),
+            (0.523, 1.0, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Gaussian",
+        &[
+            (0.0, 0.0, false),
+            (0.117, 0.023, true),
+            (0.172, 0.055, true),
+            (0.234, 0.117, true),
+            (0.305, 0.234, true),
+            (0.383, 0.414, true),
+            (0.523, 0.688, true),
+            (0.617, 0.812, true),
+            (0.703, 0.891, true),
+            (0.805, 0.953, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Half Round",
+        &[
+            (0.0, 0.0, false),
+            (0.07, 0.18, true),
+            (0.195, 0.445, true),
+            (0.266, 0.555, true),
+            (0.383, 0.703, true),
+            (0.523, 0.828, true),
+            (0.617, 0.883, true),
+            (0.773, 0.945, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Ring",
+        &[
+            (0.0, 0.0, false),
+            (0.031, 0.078, true),
+            (0.039, 0.117, true),
+            (0.117, 0.383, true),
+            (0.172, 0.609, true),
+            (0.195, 0.734, true),
+            (0.266, 0.953, true),
+            (0.305, 1.0, true),
+            (0.344, 0.992, true),
+            (0.383, 0.922, true),
+            (0.43, 0.805, true),
+            (0.477, 0.641, true),
+            (0.57, 0.281, true),
+            (0.617, 0.141, true),
+            (0.664, 0.055, true),
+            (0.703, 0.016, true),
+            (0.742, 0.016, true),
+            (0.773, 0.062, true),
+            (0.836, 0.234, true),
+            (0.859, 0.344, true),
+            (0.891, 0.445, true),
+            (0.914, 0.547, true),
+            (0.945, 0.734, true),
+            (0.977, 0.875, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Ring - Double",
+        &[
+            (0.0, 0.0, false),
+            (0.055, 0.086, true),
+            (0.094, 0.172, true),
+            (0.117, 0.242, true),
+            (0.172, 0.477, true),
+            (0.195, 0.625, true),
+            (0.266, 0.891, true),
+            (0.305, 0.945, true),
+            (0.344, 0.891, true),
+            (0.383, 0.695, true),
+            (0.43, 0.367, true),
+            (0.477, 0.07, true),
+            (0.523, 0.047, true),
+            (0.57, 0.32, true),
+            (0.617, 0.648, true),
+            (0.664, 0.867, true),
+            (0.703, 0.93, true),
+            (0.742, 0.852, true),
+            (0.773, 0.641, true),
+            (0.805, 0.375, true),
+            (0.836, 0.156, true),
+            (0.859, 0.031, true),
+            (0.891, 0.023, true),
+            (0.914, 0.109, true),
+            (0.977, 0.703, true),
+            (0.984, 0.82, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Rolling Slope - Descending",
+        &[
+            (0.0, 1.0, false),
+            (0.008, 1.0, true),
+            (0.031, 0.93, true),
+            (0.039, 0.883, true),
+            (0.07, 0.758, true),
+            (0.141, 0.539, true),
+            (0.195, 0.406, true),
+            (0.266, 0.352, true),
+            (0.305, 0.352, true),
+            (0.523, 0.57, true),
+            (0.57, 0.602, true),
+            (0.617, 0.617, true),
+            (0.703, 0.602, true),
+            (0.742, 0.562, true),
+            (0.836, 0.391, true),
+            (0.914, 0.211, true),
+            (0.945, 0.109, true),
+            (0.977, 0.039, true),
+            (0.984, 0.008, true),
+            (1.0, 0.0, false),
+        ],
+    ),
+    (
+        "Rounded Steps",
+        &[
+            (0.0, 0.234, false),
+            (0.031, 0.305, true),
+            (0.039, 0.336, true),
+            (0.094, 0.43, true),
+            (0.141, 0.477, true),
+            (0.234, 0.492, true),
+            (0.266, 0.516, true),
+            (0.305, 0.602, true),
+            (0.344, 0.664, true),
+            (0.383, 0.711, true),
+            (0.477, 0.734, true),
+            (0.523, 0.797, true),
+            (0.57, 0.898, true),
+            (0.617, 0.953, true),
+            (0.664, 0.984, true),
+            (0.773, 0.984, true),
+            (0.836, 0.906, true),
+            (0.891, 0.891, true),
+            (0.914, 0.898, true),
+            (1.0, 1.0, false),
+        ],
+    ),
+    (
+        "Sawtooth 1",
+        &[
+            (0.0, 0.0, false),
+            (0.031, 0.047, true),
+            (0.195, 0.375, true),
+            (0.266, 0.492, true),
+            (0.477, 0.047, true),
+            (0.523, 0.055, true),
+            (0.742, 0.469, true),
+            (0.773, 0.445, true),
+            (0.914, 0.18, true),
+            (0.945, 0.102, true),
+            (1.0, 0.0, false),
+        ],
+    ),
 ];
 
 /// Names earlier versions offered, still accepted by `contour` params (scripts, saved defaults).
@@ -335,6 +558,13 @@ fn fresh_effect(kind: &str) -> Option<Effect> {
 /// Edits an existing gradient in place: only the end colours and geometry.
 /// Intermediate stops, opacity stops, alignment and offset survive a round trip.
 fn overlay_gradient(g: &mut Gradient, p: &Value) {
+    // A method rebuilds the gradient from its end colours (the stops between are the old curve).
+    if p.get("method").and_then(Value::as_str).is_some_and(|m| photocraft_io::GradientMethod::from_name(m).is_some()) {
+        let ends = (g.stops.first().map(|s| s.1), g.stops.last().map(|s| s.1));
+        let from = color_of(p, "from").or(ends.0).unwrap_or(Color::BLACK);
+        let to = color_of(p, "to").or(ends.1).unwrap_or(Color::WHITE);
+        g.stops = gradient_stops(p, from, to);
+    }
     if let Some(c) = color_of(p, "from")
         && let Some(first) = g.stops.first_mut()
     {
@@ -626,10 +856,7 @@ const MAX_EFFECTS: usize = 256;
 /// mismatches and malformed snapshots are errors, never panics.
 fn replace_effects(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "layer.layerStyle.replace";
-    let id = match p.get("layer").and_then(Value::as_u64) {
-        Some(id) => photocraft_doc::LayerId(id),
-        None => s.active().and_then(|d| d.active_layer).ok_or(EngineError::Other("no active layer".into()))?,
-    };
+    let id = crate::commands::layer_param(s, p)?;
     let entries = p.get("effects").and_then(Value::as_array).ok_or_else(|| bad(CMD, "need `effects`: [{kind, params, fx?}]"))?;
     if entries.len() > MAX_EFFECTS {
         return Err(bad(CMD, format!("at most {MAX_EFFECTS} effects")));
@@ -680,10 +907,7 @@ fn set_effect(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
     let (fx, pattern) = crate::pattern_cmds::resolve_effect(s, fx)?;
     let label = format!("Layer Style: {}", fx.label());
     let add = b(p, "add", false);
-    let id = match p.get("layer").and_then(Value::as_u64) {
-        Some(id) => photocraft_doc::LayerId(id),
-        None => s.active().and_then(|d| d.active_layer).ok_or(EngineError::Other("no active layer".into()))?,
-    };
+    let id = crate::commands::layer_param(s, p)?;
     s.edit(&label, |doc, _| {
         if let Some(pat) = &pattern {
             crate::pattern_cmds::ensure_in_doc(doc, pat);
@@ -778,13 +1002,13 @@ pub fn specs() -> Vec<CommandSpec> {
         style_cmd!(
             "stroke",
             "Stroke…",
-            r##"{"size":px=3,"position":"outside|inside|center","color":"#rrggbb","from":"#rrggbb","to":"#rrggbb","style":str,"angle":deg,"opacity":0..100,"blend":str,"add":bool}"##
+            r##"{"size":px=3,"position":"outside|inside|center","color":"#rrggbb","from":"#rrggbb","to":"#rrggbb","method":"classic|perceptual|linear|smooth"?,"smoothness":0..100=100,"style":str,"angle":deg,"opacity":0..100,"blend":str,"add":bool}"##
         ),
         style_cmd!("colorOverlay", "Color Overlay…", r##"{"color":"#rrggbb","opacity":0..100=100,"blend":str,"add":bool}"##),
         style_cmd!(
             "gradientOverlay",
             "Gradient Overlay…",
-            r##"{"from":"#rrggbb","to":"#rrggbb","style":"linear|radial|angle|reflected|diamond","angle":deg=90,"scale":10..150=100,"reverse":bool,"opacity":0..100,"blend":str,"add":bool}"##
+            r##"{"from":"#rrggbb","to":"#rrggbb","method":"classic|perceptual|linear|smooth"? (Photoshop's interpolation; omitted: straight stops),"smoothness":0..100=100,"style":"linear|radial|angle|reflected|diamond","angle":deg=90,"scale":10..150=100,"reverse":bool,"opacity":0..100,"blend":str,"add":bool}"##
         ),
         style_cmd!(
             "patternOverlay",
@@ -1119,9 +1343,48 @@ mod tests {
     }
 
     #[test]
+    fn contour_presets_match_photoshop() {
+        // Photoshop 27.11, measured through Satin: Cone and Cone − Inverted Satins are identical,
+        // and Gaussian reads 0.36 at 0.5 through Satin but 0.64 as the preset curve (glows, gloss).
+        let lut = |name: &str| {
+            let Some(Contour::Custom { points, corners, .. }) = builtin_contour(name) else { panic!("{name}") };
+            photocraft_compose::adjust::contour_curve_lut(&points, &corners)
+        };
+        let satin = |name: &str| photocraft_compose::effects::satin_lut(&builtin_contour(name).unwrap()).unwrap();
+        let at = |l: &[f32], x: f32| l[(x * (l.len() - 1) as f32).round() as usize];
+        let (cone, inverted) = (satin("Cone"), satin("Cone - Inverted"));
+        for x in [0.1, 0.25, 0.5, 0.8] {
+            assert!((at(&cone, x) - at(&inverted, x)).abs() < 0.03, "{x}: {} vs {}", at(&cone, x), at(&inverted, x));
+        }
+        assert!((at(&satin("Gaussian"), 0.5) - 0.36).abs() < 0.04, "{}", at(&satin("Gaussian"), 0.5));
+        assert!((at(&lut("Gaussian"), 0.5) - 0.64).abs() < 0.03, "{}", at(&lut("Gaussian"), 0.5));
+        assert!((at(&lut("Cove - Deep"), 0.0) - 0.26).abs() < 0.02, "Cove - Deep starts above zero");
+    }
+
+    #[test]
+    fn gradient_overlay_method_matches_photoshop() {
+        // Photoshop 27.11, Classic Gradient Overlay #000000 → #ffffff (Smoothness 100 %): 0.037 at
+        // t = 1/16 and 0.5 in the middle; straight stops would give 0.0625.
+        let mut s = session();
+        s.execute("layer.layerStyle.gradientOverlay", json!({"from": "#000000", "to": "#ffffff", "method": "classic"})).unwrap();
+        let Effect::GradientOverlay { gradient, .. } = &effects(&s)[0] else { panic!() };
+        let at = |t: f32| {
+            let w = gradient.stops.windows(2).find(|w| t >= w[0].0 && t <= w[1].0).unwrap();
+            let u = (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6);
+            w[0].1.to_rgb()[0] + (w[1].1.to_rgb()[0] - w[0].1.to_rgb()[0]) * u
+        };
+        assert!((at(1.0 / 16.0) - 0.037).abs() < 0.004, "{}", at(1.0 / 16.0));
+        assert!((at(0.5) - 0.5).abs() < 0.004, "{}", at(0.5));
+        // Without a method the two stops stay as they are.
+        s.execute("layer.layerStyle.gradientOverlay", json!({"from": "#000000", "to": "#ffffff", "add": true})).unwrap();
+        let plain = effects(&s).iter().filter(|e| matches!(e, Effect::GradientOverlay { gradient, .. } if gradient.stops.len() == 2)).count();
+        assert_eq!(plain, 1, "the added overlay keeps its two stops");
+    }
+
+    #[test]
     fn contour_presets_and_custom_curves_apply_in_one_undo_step() {
         let mut s = session();
-        // Picking Cone: the preset's own curve, its peak a corner, in one undo step.
+        // Picking Cone: the preset's own curve, its points corners, in one undo step.
         s.execute("layer.layerStyle.dropShadow", json!({"contour": "Cone", "antiAlias": true})).unwrap();
         let Effect::DropShadow(sh) = &effects(&s)[0] else { panic!() };
         assert_eq!(sh.contour, builtin_contour("Cone").unwrap());
@@ -1129,7 +1392,9 @@ mod tests {
         let Contour::Custom { points, corners, .. } = &sh.contour else { panic!() };
         let lut = photocraft_compose::adjust::contour_curve_lut(points, corners);
         let at = |x: f32| lut[(x * (lut.len() - 1) as f32).round() as usize];
-        assert!((at(0.5) - 1.0).abs() < 1e-3 && (at(0.25) - 0.5).abs() < 0.01, "a sharp Λ, not a rounded hump");
+        // Photoshop's measured Cone: 0 at both ends, a 0.99 peak at 0.5, symmetric.
+        assert!(at(0.0).abs() < 1e-3 && at(1.0).abs() < 1e-3 && at(0.5) > 0.98, "a Λ: {} {} {}", at(0.0), at(0.5), at(1.0));
+        assert!((at(0.25) - at(0.75)).abs() < 0.03, "symmetric: {} vs {}", at(0.25), at(0.75));
         assert_eq!(contour_param(&sh.contour), json!("Cone"));
         s.execute("edit.undo", json!({})).unwrap();
         assert!(effects(&s).is_empty(), "one undo removes it");

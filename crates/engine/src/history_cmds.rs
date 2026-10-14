@@ -199,8 +199,39 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
     s.active().map(|_| ()).ok_or_else(|| "no document open".into())
 }
 
+/// `history.undo` / `history.redo` enable predicates, matching `edit.undo` / `edit.redo`.
+fn can_undo(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| d.history.can_undo()).map(|_| ()).ok_or_else(|| "nothing to undo".into())
+}
+
+fn can_redo(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| d.history.can_redo()).map(|_| ()).ok_or_else(|| "nothing to redo".into())
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        // `history.*` aliases of Edit › Undo / Redo, so a client reaching for the History namespace
+        // finds them (`edit.undo` / `edit.redo` remain the menu items and own the shortcuts, #3675).
+        CommandSpec {
+            id: "history.undo",
+            label: "Undo",
+            menu: &[],
+            shortcut: None,
+            params: "{} (the same action as `edit.undo`)",
+            enabled: can_undo,
+            run: |s, _| Ok(json!(s.undo())),
+            journal: false,
+        },
+        CommandSpec {
+            id: "history.redo",
+            label: "Redo",
+            menu: &[],
+            shortcut: None,
+            params: "{} (the same action as `edit.redo`)",
+            enabled: can_redo,
+            run: |s, _| Ok(json!(s.redo())),
+            journal: false,
+        },
         CommandSpec {
             id: "history.deleteState",
             label: "Delete State",
@@ -280,6 +311,16 @@ mod tests {
 
     fn entries(s: &Session) -> Vec<String> {
         s.active().unwrap().history.entries()
+    }
+
+    #[test]
+    fn history_undo_and_redo_alias_edit_undo_and_redo() {
+        let mut s = session();
+        let n = s.active().unwrap().history.past_len();
+        s.execute("history.undo", json!({})).unwrap();
+        assert_eq!(s.active().unwrap().history.past_len(), n - 1, "history.undo steps back like edit.undo");
+        s.execute("history.redo", json!({})).unwrap();
+        assert_eq!(s.active().unwrap().history.past_len(), n, "history.redo steps forward like edit.redo");
     }
 
     #[test]

@@ -30,14 +30,24 @@ fn compress(data: &[u8]) -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
 }
 
-fn decompress(data: &[u8], expected: usize, what: &str) -> Result<Vec<u8>> {
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| FormatError::corrupt(format!("{what}: zstd: {e}")))?;
-    let mut out = Vec::with_capacity(expected.min(64 << 20));
-    (&mut dec).take(expected as u64 + 1).read_to_end(&mut out).map_err(|e| FormatError::corrupt(format!("{what}: zstd: {e}")))?;
-    if out.len() != expected {
-        return Err(FormatError::corrupt(format!("{what}: expected {expected} bytes, got {}", out.len())));
+/// Decodes a zstd frame of at most `max` bytes (`LimitExceeded` beyond). With `exact`, the
+/// decoded length must be exactly that (`Corrupt` otherwise).
+fn decompress_bounded(data: &[u8], max: usize, exact: Option<usize>, what: &str) -> Result<Vec<u8>> {
+    let zstd = |e: &dyn std::fmt::Display| FormatError::corrupt(format!("{what}: zstd: {e}"));
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| zstd(&e))?;
+    let mut out = Vec::with_capacity(exact.unwrap_or(0).min(max).min(64 << 20));
+    // `max` may be `usize::MAX`: one byte past it must not overflow.
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    (&mut dec).take(limit).read_to_end(&mut out).map_err(|e| zstd(&e))?;
+    match exact {
+        Some(n) if out.len() != n => Err(FormatError::corrupt(format!("{what}: expected {n} bytes, got {}", out.len()))),
+        None if out.len() > max => Err(FormatError::LimitExceeded(format!("{what} exceeds {max} bytes"))),
+        _ => Ok(out),
     }
-    Ok(out)
+}
+
+fn decompress(data: &[u8], expected: usize, what: &str) -> Result<Vec<u8>> {
+    decompress_bounded(data, expected, Some(expected), what)
 }
 
 fn hash_bytes(b: &[u8]) -> Hash {
@@ -228,12 +238,7 @@ impl Fetch for LoadFetch<'_> {
         let z = self.src.get(&path, self.opts.max_blob_bytes)?;
         // Blob length is not in the manifest; the frame header bounds it and
         // we cap at max_blob_bytes.
-        let mut dec = ruzstd::decoding::StreamingDecoder::new(&z[..]).map_err(|e| FormatError::corrupt(format!("{path}: zstd: {e}")))?;
-        let mut data = Vec::new();
-        (&mut dec).take(self.opts.max_blob_bytes as u64 + 1).read_to_end(&mut data).map_err(|e| FormatError::corrupt(format!("{path}: zstd: {e}")))?;
-        if data.len() > self.opts.max_blob_bytes {
-            return Err(FormatError::LimitExceeded(format!("{path} exceeds max_blob_bytes")));
-        }
+        let data = decompress_bounded(&z, self.opts.max_blob_bytes, None, &path)?;
         self.account(data.len())?;
         if hash_bytes(&data) != hash {
             return Err(FormatError::corrupt(format!("{path}: content does not match its hash")));
@@ -313,13 +318,7 @@ impl Sink for Collect<'_> {
             self.tiles.entry(h.clone()).or_insert_with(|| (tile.clone(), format.sample));
             return h;
         }
-        let h = if cfg!(target_endian = "big") {
-            let mut b = tile.bytes().to_vec();
-            swap_to_le(&mut b, format.sample);
-            hash_bytes(&b)
-        } else {
-            hash_bytes(tile.bytes())
-        };
+        let h = hash_bytes(&tile_le(tile, format.sample));
         if let Some(cache) = self.hash_cache.as_deref_mut() {
             cache.insert(key, (Arc::downgrade(tile), h.clone()));
         }
@@ -414,19 +413,21 @@ enum Object {
 
 impl Object {
     fn compressed(&self) -> Vec<u8> {
-        match self {
-            Object::Tile(t, s) => compress(&tile_le(t, *s)),
-            Object::Blob(b) => compress(b),
-        }
+        compress(&self.content())
     }
 
-    fn matches_content_hash(&self, compressed: &[u8], what: &str) -> bool {
-        let expected = match self {
+    /// The bytes this object stores (tiles little-endian).
+    fn content(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
             Object::Tile(tile, sample) => tile_le(tile, *sample),
             Object::Blob(blob) => std::borrow::Cow::Borrowed(blob.as_slice()),
-        };
-        decompress(compressed, expected.len(), what).is_ok_and(|actual| hash_bytes(&actual) == hash_bytes(&expected))
+        }
     }
+}
+
+/// Whether `compressed` decodes to exactly `expected`.
+fn content_matches(expected: &[u8], compressed: &[u8], what: &str) -> bool {
+    decompress(compressed, expected.len(), what).is_ok_and(|actual| hash_bytes(&actual) == hash_bytes(expected))
 }
 
 fn file_signature(metadata: &std::fs::Metadata) -> Option<FileSignature> {
@@ -569,10 +570,82 @@ fn write_bundle_file(root: &Path, path: &Path, data: &[u8]) -> Result<()> {
     result
 }
 
-fn remove_bundle_file(root: &Path, path: &Path) -> Result<()> {
+/// Keep the existing leaf/path validation and pin the actual unlink to opened
+/// directory handles on Unix. This closes the check-then-remove path-swap gap.
+fn remove_bundle_file(root: &Path, path: &Path, gc: &BundleGc) -> Result<()> {
     validate_bundle_file(root, path)?;
-    std::fs::remove_file(path)?;
-    Ok(())
+    let relative = path.strip_prefix(root).map_err(|_| unsafe_bundle_entry(path))?;
+    gc.remove(relative)
+}
+
+#[cfg(unix)]
+struct BundleGc {
+    root: rustix::fd::OwnedFd,
+    tiles: rustix::fd::OwnedFd,
+    blobs: rustix::fd::OwnedFd,
+    composite: rustix::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+fn gc_directory_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+
+    // GC needs directory traversal, not permission to read a directory listing.
+    // Both modes retain a descriptor for the directory opened here, so a later
+    // pathname replacement cannot redirect descriptor-relative cleanup.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = OFlags::PATH;
+    #[cfg(target_vendor = "apple")]
+    let access = OFlags::from_bits_retain(libc::O_SEARCH.cast_unsigned());
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let access = OFlags::RDONLY;
+    access | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+#[cfg(unix)]
+impl BundleGc {
+    fn new(root: &Path) -> Result<Self> {
+        use rustix::fs::{Mode, open, openat};
+
+        let flags = gc_directory_flags();
+        let root = open(root, flags, Mode::empty()).map_err(std::io::Error::from)?;
+        let tiles = openat(&root, "tiles", flags, Mode::empty()).map_err(std::io::Error::from)?;
+        let blobs = openat(&root, "blobs", flags, Mode::empty()).map_err(std::io::Error::from)?;
+        let composite = openat(&root, "composite", flags, Mode::empty()).map_err(std::io::Error::from)?;
+        Ok(Self { root, tiles, blobs, composite })
+    }
+
+    fn remove(&self, relative: &Path) -> Result<()> {
+        let relative = relative.to_str().ok_or_else(|| unsafe_bundle_entry(relative))?;
+        let (handle, name) = match relative {
+            THUMB => (&self.root, THUMB),
+            COMPOSITE => (&self.composite, "preview.png"),
+            _ => match relative.split_once('/') {
+                Some(("tiles", name)) if name.strip_suffix(".zst").is_some_and(is_valid_hash) => (&self.tiles, name),
+                Some(("blobs", name)) if name.strip_suffix(".zst").is_some_and(is_valid_hash) => (&self.blobs, name),
+                _ => return Err(FormatError::Unsupported(format!("invalid bundle cleanup target: {relative}"))),
+            },
+        };
+        rustix::fs::unlinkat(handle, name, rustix::fs::AtFlags::empty()).map_err(std::io::Error::from)?;
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+struct BundleGc {
+    root: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl BundleGc {
+    fn new(root: &Path) -> Result<Self> {
+        Ok(Self { root: root.to_path_buf() })
+    }
+
+    fn remove(&self, relative: &Path) -> Result<()> {
+        std::fs::remove_file(self.root.join(relative))?;
+        Ok(())
+    }
 }
 
 fn existing_object_is_valid(path: &Path, object: &Object, what: &str) -> Result<(bool, Option<FileSignature>)> {
@@ -587,10 +660,8 @@ fn existing_object_is_valid(path: &Path, object: &Object, what: &str) -> Result<
     }
     let signature = file_signature(&metadata);
 
-    let expected_len = match object {
-        Object::Tile(tile, sample) => tile_le(tile, *sample).len(),
-        Object::Blob(blob) => blob.len(),
-    };
+    let expected = object.content();
+    let expected_len = expected.len();
     // This is the same bound used by the tile loader. It comfortably includes
     // zstd framing overhead while keeping damaged files bounded when inspected.
     let max_compressed_len = expected_len.saturating_add(expected_len / 8).saturating_add(4096);
@@ -604,7 +675,7 @@ fn existing_object_is_valid(path: &Path, object: &Object, what: &str) -> Result<
     if compressed.len() > max_compressed_len {
         return Ok((false, None));
     }
-    Ok((object.matches_content_hash(&compressed, what), signature))
+    Ok((content_matches(&expected, &compressed, what), signature))
 }
 
 /// A bundle path and its compressed bytes.
@@ -803,11 +874,14 @@ impl PcraftWriter {
         for (name, data) in &p.previews {
             write_bundle_file(dir, &dir.join(name), data)?;
         }
+        // Pin all GC directories before removing stale previews or objects.
+        // Unix cleanup then stays within these directories even if a pathname is swapped.
+        let gc = BundleGc::new(dir)?;
         for stale in [THUMB, COMPOSITE] {
             if !p.previews.iter().any(|(n, _)| *n == stale) {
                 let path = dir.join(stale);
                 validate_bundle_file(dir, &path)?;
-                match remove_bundle_file(dir, &path) {
+                match remove_bundle_file(dir, &path, &gc) {
                     Err(FormatError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
                     other => other?,
                 }
@@ -819,7 +893,7 @@ impl PcraftWriter {
         // complete save into a reported failure); a leftover is retried on the next save.
         for path in existing {
             if !p.objects.contains_key(&path) {
-                if remove_bundle_file(dir, &dir.join(&path)).is_ok() {
+                if remove_bundle_file(dir, &dir.join(&path), &gc).is_ok() {
                     stats.objects_removed += 1;
                 }
                 if let Some(cache) = &mut self.verified_directory {
@@ -867,6 +941,36 @@ impl PcraftWriter {
     }
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn gc_pinned_directory_handles_resist_subdirectory_swap() {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!("pcraft-gc-swap-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let bundle = root.join("project.pcraft");
+    let outside = root.join("outside");
+    for sub in ["tiles", "blobs", "composite"] {
+        std::fs::create_dir_all(bundle.join(sub)).unwrap();
+    }
+    std::fs::create_dir(&outside).unwrap();
+    let filename = format!("{}.zst", "c".repeat(64));
+    std::fs::write(bundle.join("tiles").join(&filename), b"stale bundle file").unwrap();
+    std::fs::write(outside.join(&filename), b"outside file must survive").unwrap();
+
+    let gc = BundleGc::new(&bundle).unwrap();
+    std::fs::rename(bundle.join("tiles"), bundle.join("old-tiles")).unwrap();
+    symlink(&outside, bundle.join("tiles")).unwrap();
+
+    // Exercise the descriptor-relative unlink directly: the public save path
+    // also validates the leaf, but that check itself cannot prevent a later swap.
+    gc.remove(Path::new(&format!("tiles/{filename}"))).unwrap();
+    assert!(!bundle.join("old-tiles").join(&filename).exists());
+    assert_eq!(std::fs::read(outside.join(&filename)).unwrap(), b"outside file must survive");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn list_objects(dir: &Path) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
     for sub in ["tiles", "blobs"] {
@@ -879,7 +983,7 @@ fn list_objects(dir: &Path) -> Result<HashSet<String>> {
         for e in rd {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".zst") {
+            if name.strip_suffix(".zst").is_some_and(is_valid_hash) {
                 let path = e.path();
                 match std::fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.file_type().is_symlink() => return Err(unsafe_bundle_entry(&path)),

@@ -88,6 +88,7 @@ fn exercise(b: &[u8]) {
     let _ = identify(b);
     let _ = embedded_preview(b);
     let _ = embedded_previews(b);
+    let _ = embedded_preview_color_space(b);
     let opts = DevelopOptions { limits: Limits { max_alloc: 64 << 20, ..Limits::default() }, ..Default::default() };
     if let Ok(s) = decode(b, &opts.limits) {
         for m in [Demosaic::Bilinear, Demosaic::Ahd] {

@@ -424,6 +424,26 @@ fn rects_id() -> egui::Id {
     egui::Id::new("dock-group-rects")
 }
 
+/// The group expanded from its collapsed tab strip (see [`show`]), if any: with Preferences ▸
+/// Workspace ▸ Auto-Collapse Iconic Panels on, the first click outside it collapses it again.
+fn peek_id() -> egui::Id {
+    egui::Id::new("dock-peek")
+}
+
+fn auto_collapse_peek(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let Some(g) = ctx.data(|d| d.get_temp::<Option<Group>>(peek_id())).flatten() else { return };
+    let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten()) else {
+        return;
+    };
+    let inside = last_rects(ctx).into_iter().find(|(x, _)| *x == g).is_some_and(|(_, r)| r.contains(p));
+    if !inside {
+        app.ui.dock.set_collapsed(g, true);
+        ctx.data_mut(|d| {
+            d.insert_temp(peek_id(), None::<Group>);
+        });
+    }
+}
+
 /// A group's tab strip as drawn last frame (screen points), for tests and automation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripRects {
@@ -451,6 +471,14 @@ fn strips_id() -> egui::Id {
 /// group's tab content.
 pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut body: impl FnMut(&mut PhotocraftApp, &mut egui::Ui, Group, usize)) {
     let t = Tokens::get(ui.ctx());
+    let auto_collapse = app.session.prefs().workspace.auto_collapse_icon_panels;
+    if auto_collapse {
+        auto_collapse_peek(app, ui.ctx());
+    } else {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(peek_id(), None::<Group>);
+        });
+    }
     let strip = if t.pro { 28.0 } else { 40.0 };
     let order: Vec<Group> = app.ui.dock.order().into_iter().filter(|g| shown.contains(g)).collect();
     let area = ui.available_rect_before_wrap();
@@ -458,6 +486,7 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
     let locked = app.session.prefs().workspace_locked;
     let rects = rects_after_layout(&heights, area);
     let mut actions: Vec<Action> = Vec::new();
+    let mut peek_after: Option<Group> = None;
     let mut tab_drops: Vec<(Group, usize, Pos2)> = Vec::new();
     let mut dragging: Option<Group> = None;
     let mut strips: Vec<StripRects> = Vec::with_capacity(rects.len());
@@ -525,6 +554,11 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
         }
         if resp.strip.double_clicked() || resp.tab_double_clicked || (collapsed && resp.tab_clicked) {
             actions.push(Action::ToggleCollapse(g));
+            // A single click on a collapsed strip's tab expands the group as a peek: the next
+            // click outside closes it again, with Auto-Collapse Iconic Panels on.
+            if collapsed && resp.tab_clicked && !resp.tab_double_clicked && auto_collapse {
+                peek_after = Some(g);
+            }
         }
         // The strip uses visible indices; reorder in original ones.
         if !locked
@@ -565,6 +599,14 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
             }
             if tabs.get(sel) == Some(&"Swatches") {
                 crate::swatches_ui::panel_menu(app, ui);
+                ui.separator();
+            }
+            if tabs.get(sel) == Some(&"Brush Settings") {
+                crate::brush_panel::panel_menu(app, ui);
+                ui.separator();
+            }
+            if tabs.get(sel) == Some(&"Actions") {
+                crate::actions::panel_menu(app, ui);
                 ui.separator();
             }
             if let Some(label) = tabs.get(sel) {
@@ -662,6 +704,13 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
                 }
             }
         }
+    }
+    if let Some(g) = peek_after
+        && !app.ui.dock.is_collapsed(g)
+    {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(peek_id(), Some(g));
+        });
     }
     for (panel, anchor, before) in panel_moves {
         let params = if before { json!({"panel":panel,"anchor":anchor,"before":anchor}) } else { json!({"panel":panel,"anchor":anchor}) };

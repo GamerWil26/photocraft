@@ -7,9 +7,9 @@ order = 5
 [[item]]
 id = "TYPE-218-1"
 target = "Type on a path: path shape, glyphs along the curve, caret follows, PSD round trip"
-status = "missing"
+status = "partial"
 issue = 218
-note = "doc text.rs:209 TextShape has Point and Box only"
+note = "TextShape::Path (doc text.rs) with glyphs placed rigidly along the curve by arc length (text warp.rs PathFrame), type.attachToPath and type.detachFromPath (#4365), .pcraft round trip. Missing: clicking a path with the Type tool, the caret and selection following the curve, and PSD path text (it saves as point text)"
 
 [[item]]
 id = "TYPE-218-2"
@@ -23,7 +23,7 @@ id = "TYPE-218-3"
 target = "Thai/Khmer/Indic fallback fonts; golden shaping tests for complex scripts and RTL"
 status = "partial"
 issue = 218
-note = "Thai is covered: THAI_FAMILIES (fonts.rs) lists the Windows, macOS and Linux families and thai_in_latin_font_falls_back_to_installed_thai_font checks a sample with above and below marks (#1909); Arabic and Hebrew fall back too. Khmer and Indic have no fallback list, and there are no per-script golden shaping tests (only a bidi test)"
+note = "Fallback fonts are covered for Thai, Khmer, Lao, Myanmar (THAI_FAMILIES, KHMER_FAMILIES, LAO_FAMILIES, MYANMAR_FAMILIES in fonts.rs; #1909, #3259), the nine Indic scripts (INDIC_FAMILIES: Nirmala UI, Kohinoor and Sangam MN, Noto Sans) and Arabic and Hebrew. Still missing: per-script golden shaping tests against reference output (only smoke tests that an installed font shapes without .notdef, plus a bidi test)"
 
 [[item]]
 id = "TYPE-218-4"
@@ -37,7 +37,7 @@ id = "TYPE-218-5"
 target = "OpenType UI: Character panel buttons, Numerals and Stylistic Sets submenus"
 status = "partial"
 issue = 218
-note = "Type > OpenType toggles (type_extra_cmds.rs:512); no panel buttons or submenus"
+note = "Type > OpenType toggles (type_extra_cmds.rs:512). Character panel (and the Properties Character section) has Photoshop's eight OpenType buttons: Standard Ligatures, Contextual Alternates, Discretionary Ligatures, Swash, Stylistic Alternates, Titling Alternates, Ordinals, Fractions, pressed while the feature is on at the selection and dispatching the type.openType.* commands (type_tool.rs opentype_row; character_panel_opentype_buttons_toggle_and_show_the_feature, #3752). Still missing: the Numerals and Stylistic Sets submenus, and greying out features the font lacks"
 
 [[item]]
 id = "TYPE-218-6"

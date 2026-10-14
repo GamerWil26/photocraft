@@ -17,6 +17,9 @@ pub use type_ahead::list_open as dropdown_list_open;
 /// The setting is local to this popup's Ui and leaves other themes unchanged.
 pub fn style_spectrum_popup_menu(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
+    // The 6 pt gap between rows was outside both buttons, so a drag across a menu
+    // dropped the highlight (#4602). Padding stays inside the row, which is the hit target.
+    ui.spacing_mut().item_spacing.y = 0.0;
     if !t.pro {
         return;
     }
@@ -26,7 +29,9 @@ pub fn style_spectrum_popup_menu(ui: &mut Ui) {
     v.widgets.hovered.bg_fill = t.accent;
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     v.widgets.hovered.bg_stroke = Stroke::NONE;
-    v.widgets.hovered.corner_radius = CornerRadius::same(3);
+    v.widgets.inactive.corner_radius = CornerRadius::ZERO;
+    v.widgets.hovered.corner_radius = CornerRadius::ZERO;
+    v.widgets.active.corner_radius = CornerRadius::ZERO;
 }
 
 /// An accent insertion line on one edge of `r` while a drag hovers it (vertical: on its left or,
@@ -220,6 +225,25 @@ fn pro_panel(
     CardResponse::new(strip_resp, mresp, tabs_out)
 }
 
+/// The panel menu button (hamburger in Pro, ellipsis in Studio), matching the dock and cards.
+pub fn panel_menu_button(ui: &mut Ui) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let size = vec2(20.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let tint = crate::icons::button_chrome(ui, rect, false, resp.hovered());
+    if t.pro {
+        for k in 0..3 {
+            let y = rect.center().y - 3.5 + k as f32 * 3.5;
+            ui.painter().line_segment([pos2(rect.center().x - 5.0, y), pos2(rect.center().x + 5.0, y)], Stroke::new(1.0, tint));
+        }
+    } else {
+        crate::icons::paint(ui, rect, "ellipsis", 14.0, tint);
+    }
+    let tip = tl!("Panel menu");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    resp.on_hover_text(tip)
+}
+
 pub fn pill_tab(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let t = Tokens::get(ui.ctx());
     let font = theme::medium(12.5);
@@ -276,6 +300,11 @@ pub fn compact_value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeI
     value_field_box(ui, value, range, suffix, vec2(width, height), 0.0, FieldOpts::default()).0
 }
 
+/// A compact field whose mouse scrub wraps at the native fullscreen viewport's horizontal edges.
+pub(crate) fn compact_wrapping_value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, size: Vec2) -> Response {
+    value_field_box(ui, value, range, suffix, size, 0.0, FieldOpts { wrap_drag: true, ..Default::default() }).0
+}
+
 /// A size dialog's unit key (`px`, `in`, `cm`, `mm`, `pt`, `pica`, `percent`) as a unit.
 pub fn unit_of_key(key: &str) -> photocraft_engine::prefs::Unit {
     use photocraft_engine::prefs::Unit;
@@ -300,7 +329,7 @@ pub fn unit_decimals(key: &str) -> u32 {
 /// A [`value_field`] showing `decimals` decimal places instead of the one (or two, for a small
 /// range) it picks itself: the ruler units need their own precision (#2434).
 pub fn value_field_prec(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32, decimals: u32) -> Response {
-    value_field_in(ui, value, range, suffix, width, 0.0, FieldOpts { decimals: Some(decimals), units: None }).0
+    value_field_in(ui, value, range, suffix, width, 0.0, FieldOpts { decimals: Some(decimals), ..Default::default() }).0
 }
 
 /// A field's unit and the resolution a typed unit converts at (`1in` in a px field).
@@ -316,7 +345,7 @@ pub struct FieldUnits {
 /// A [`value_field_prec`] without a suffix, whose unit is chosen beside it (Image Size and New
 /// Document's unit menus) and converts typed units at that dialog's own resolution.
 pub fn value_field_units(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, width: f32, decimals: u32, units: FieldUnits) -> Response {
-    value_field_in(ui, value, range, "", width, 0.0, FieldOpts { decimals: Some(decimals), units: Some(units) }).0
+    value_field_in(ui, value, range, "", width, 0.0, FieldOpts { decimals: Some(decimals), units: Some(units), ..Default::default() }).0
 }
 
 fn field_resolution_id() -> egui::Id {
@@ -444,6 +473,7 @@ struct FieldOpts {
     decimals: Option<u32>,
     /// The unit typed units convert into (default: the suffix's, at [`set_field_resolution`]).
     units: Option<FieldUnits>,
+    wrap_drag: bool,
 }
 
 /// A [`value_field`] that leaves `trailing` points free inside its box, right of the suffix, and
@@ -470,7 +500,7 @@ fn value_field_box(
     trailing: f32,
     opts: FieldOpts,
 ) -> (Response, Rect) {
-    let FieldOpts { decimals, units } = opts;
+    let FieldOpts { decimals, units, wrap_drag } = opts;
     let t = Tokens::get(ui.ctx());
     let (rect, slot) = ui.allocate_exact_size(size, Sense::hover());
     let scrub = take_label_scrub(ui, rect);
@@ -518,7 +548,7 @@ fn value_field_box(
             ui.spacing_mut().button_padding = Vec2::ZERO;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
-                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine, decimals, units)).inner
+                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine, decimals, units, wrap_drag)).inner
             })
             .inner
         }
@@ -661,6 +691,45 @@ pub fn popup_value_field(ui: &mut Ui, name: &str, value: &mut f32, range: std::o
     out
 }
 
+/// Height of a [`text_field`]'s box, matching a [`value_field`].
+pub const TEXT_FIELD_H: f32 = 24.0;
+
+/// Inner padding of a [`text_field`]'s box: 6 pt either side, 2 pt above and below.
+const TEXT_FIELD_PAD: Vec2 = vec2(6.0, 2.0);
+
+/// A single-line text field in PhotoCraft's shared field style (#3789): the same box as a
+/// [`value_field`] -- the theme's field fill and `field_border`, rounded by `radius_sm` -- with a
+/// consistent inner padding and no focus outline. egui's default white focus ring (its
+/// `selection.stroke`) is what made the Preferences search field look different from the Color
+/// Picker's hex field, so every plain, non-numeric input (search, hex, name, filter) is drawn
+/// through here to look and behave the same. `id` carries the field's text and focus across
+/// frames; `hint` shows while it is empty; `mono` picks the monospaced face for hex and other
+/// code-like values.
+pub fn text_field(ui: &mut Ui, id: egui::Id, text: &mut String, hint: &str, width: f32, mono: bool) -> Response {
+    text_field_ex(ui, id, text, hint, width, mono, None)
+}
+
+/// [`text_field`] limited to `char_limit` characters (a hex field's six digits, say).
+pub fn text_field_ex(ui: &mut Ui, id: egui::Id, text: &mut String, hint: &str, width: f32, mono: bool, char_limit: Option<usize>) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(vec2(width.max(16.0), TEXT_FIELD_H), Sense::hover());
+    surface(ui, rect, t.field, false);
+    if !t.bevel {
+        ui.painter().rect_stroke(rect, t.radius_sm, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
+    }
+    let font = if mono { theme::mono(12.0) } else { egui::FontId::proportional(12.5) };
+    let mut edit = egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(egui::Frame::NONE).font(font);
+    if let Some(limit) = char_limit {
+        edit = edit.char_limit(limit);
+    }
+    // A child Ui keeps the field's selection colour local: `Visuals::selection` also fills selected
+    // list rows and slider trails, which must keep the theme's.
+    let layout = egui::Layout::centered_and_justified(egui::Direction::TopDown);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(TEXT_FIELD_PAD)).layout(layout));
+    child.style_mut().visuals.selection.bg_fill = t.field_selection();
+    child.add(edit)
+}
+
 fn first_field_id() -> egui::Id {
     egui::Id::new("pc-focus-first-field")
 }
@@ -687,6 +756,7 @@ fn number_edit(
     fine: bool,
     decimals: Option<u32>,
     units: crate::numeric_expression::Units,
+    wrap_drag: bool,
 ) -> Response {
     let (id, ctx) = (ui.next_auto_id(), ui.ctx().clone());
     // Focused before the DragValue is drawn, so it gains focus this frame and selects its text.
@@ -701,10 +771,14 @@ fn number_edit(
     let math = ui.memory(|m| m.has_focus(id)) && ui.data(|d| d.get_temp(held)).unwrap_or(false);
     ui.data_mut(|d| d.insert_temp(held, math));
     let before = *value;
+    let speed = if fine { 0.01 } else { 0.5 };
+    let wrapping = wrap_drag && crate::scrub_wrap::active(ui);
+    let wrapped_drag = wrapping && ui.input(|i| i.pointer.primary_down());
     let mut resp = ui.add(
         egui::DragValue::new(value)
-            .range(range)
-            .speed(if fine { 0.01 } else { 0.5 })
+            .range(range.clone())
+            // A warp is an absolute-position jump. The scoped scrub below removes that jump.
+            .speed(if wrapped_drag { 0.0 } else { speed })
             .custom_formatter(move |v, _| match decimals {
                 Some(d) => fmt_num_prec(v, d),
                 None if fine => fmt_num2(v),
@@ -722,6 +796,9 @@ fn number_edit(
                 v
             }),
     );
+    if wrap_drag {
+        crate::scrub_wrap::update(ui, &resp, value, before, range, speed, wrapping);
+    }
     resp.flags.set(egui::response::Flags::CHANGED, *value != before);
     resp
 }
@@ -779,7 +856,7 @@ fn wheel_notches(ui: &Ui, resp: &Response) -> f32 {
 }
 
 /// [`wheel_notches`] of widget `id` while `hovered`, a notch with Shift counting `shift_notches`.
-fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) -> f32 {
+pub(crate) fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) -> f32 {
     if !hovered {
         return 0.0;
     }
@@ -935,6 +1012,22 @@ pub fn slider_row_with(
     gradient: Option<&[Color32]>,
     g: RowGestures,
 ) -> Response {
+    slider_row_prec(ui, label, value, range, suffix, gradient, g, None)
+}
+
+/// [`slider_row_with`] whose field shows `decimals` places instead of the one (or two, for a
+/// small range) it picks itself: Exposure's ±20 stops show two, its Offset four (#4164).
+#[allow(clippy::too_many_arguments)]
+pub fn slider_row_prec(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    gradient: Option<&[Color32]>,
+    g: RowGestures,
+    decimals: Option<u32>,
+) -> Response {
     let t = Tokens::get(ui.ctx());
     let mut changed_resp = None;
     ui.horizontal(|ui| {
@@ -942,7 +1035,7 @@ pub fn slider_row_with(
         let l = ui.label(egui::RichText::new(tl!(label)).color(t.text_dim));
         scrub_label_within(ui, &l, f32::INFINITY);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            changed_resp = Some(value_field(ui, value, range.clone(), suffix, 74.0));
+            changed_resp = Some(value_field_in(ui, value, range.clone(), suffix, 74.0, 0.0, FieldOpts { decimals, ..Default::default() }).0);
         });
     });
     let s = slider_with(ui, value, range, gradient, g);
@@ -1509,19 +1602,13 @@ pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let (rect, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
-            let p = ui.painter();
-            if *on {
-                p.rect_filled(rect, 2.0, t.accent);
-                let a = rect.left_center() + vec2(3.0, 0.5);
-                let b = rect.center_bottom() + vec2(-1.0, -3.5);
-                let c = rect.right_top() + vec2(-3.0, 3.5);
-                p.line_segment([a, b], Stroke::new(1.8, Color32::WHITE));
-                p.line_segment([b, c], Stroke::new(1.8, Color32::WHITE));
-            } else {
-                p.rect_filled(rect, 2.0, t.field);
-                p.rect_stroke(rect, 2.0, Stroke::new(1.5, if resp.hovered() { t.text_dim } else { t.text_faint }), StrokeKind::Inside);
-            }
-            let l = ui.add(egui::Label::new(egui::RichText::new(tl!(label)).color(t.text_dim)).sense(Sense::click()));
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let l = ui
+                .add(egui::Label::new(egui::RichText::new(tl!(label)).color(t.text_dim)).selectable(false).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            // Pressing the label presses the box (#4476).
+            let pressed = resp.is_pointer_button_down_on() || l.is_pointer_button_down_on();
+            check_box(ui.painter(), rect, *on, resp.hovered() || l.hovered(), pressed, &t);
             resp.union(l)
         })
         .inner;
@@ -1530,6 +1617,34 @@ pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
         resp.mark_changed();
     }
     resp
+}
+
+/// The fill of a check box: the accent when `on`, else the field colour. While it's pressed
+/// (the mouse is down on it or on its label) Photoshop shows that a release will act: an
+/// unchecked box darkens a little and a checked one turns a little less opaque (#4476).
+pub fn check_box_fill(on: bool, pressed: bool, t: &Tokens) -> Color32 {
+    match (on, pressed) {
+        (true, false) => t.accent,
+        (true, true) => t.accent.gamma_multiply(0.75),
+        (false, false) => t.field,
+        (false, true) => t.field.lerp_to_gamma(Color32::BLACK, 0.18),
+    }
+}
+
+/// Paint a check box in `rect`: [`check_box_fill`] with a white tick when `on`, else an
+/// outline that brightens while `hovered` or `pressed`.
+pub fn check_box(p: &egui::Painter, rect: Rect, on: bool, hovered: bool, pressed: bool, t: &Tokens) {
+    p.rect_filled(rect, 2.0, check_box_fill(on, pressed, t));
+    if on {
+        let a = rect.left_center() + vec2(3.0, 0.5);
+        let b = rect.center_bottom() + vec2(-1.0, -3.5);
+        let c = rect.right_top() + vec2(-3.0, 3.5);
+        let tick = Stroke::new(rect.width() * 0.125, Color32::WHITE);
+        p.line_segment([a, b], tick);
+        p.line_segment([b, c], tick);
+    } else {
+        p.rect_stroke(rect, 2.0, Stroke::new(1.5, if hovered || pressed { t.text_dim } else { t.text_faint }), StrokeKind::Inside);
+    }
 }
 
 /// Small chevron for dropdowns (replaces egui's filled triangle).
@@ -1589,6 +1704,27 @@ fn clean(text: &str) -> String {
 mod tests {
     use egui::{Key, Modifiers};
 
+    #[test]
+    fn checkbox_label_is_a_button_target_not_selectable_text() {
+        use egui::CursorIcon;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut h = Harness::builder().with_size(egui::vec2(300.0, 80.0)).build_ui_state(
+            |ui, on: &mut bool| {
+                super::checkbox(ui, on, "Show Transform Controls");
+            },
+            false,
+        );
+        h.run_steps(2);
+        let label = h.get_by_label("Show Transform Controls").rect();
+        h.hover_at(label.center());
+        h.run_steps(2);
+        assert_eq!(h.output().platform_output.cursor_icon, CursorIcon::PointingHand);
+        h.get_by_label("Show Transform Controls").click();
+        h.run_steps(2);
+        assert!(*h.state());
+    }
+
     /// #3208: a rounded swatch's checker is one shared, repeating, unblurred two-by-two tile on
     /// the rounded rect, scaled so a cell stays `cell` points, so nothing shows past the corners.
     #[test]
@@ -1639,6 +1775,7 @@ mod tests {
                 let original_padding = ui.spacing().button_padding;
                 let original_hover = ui.visuals().widgets.hovered.fg_stroke;
                 super::style_spectrum_popup_menu(ui);
+                assert_eq!(ui.spacing().item_spacing.y, 0.0, "{kind:?}: menu rows meet so the gap is selectable");
                 if tokens.pro {
                     assert_eq!(ui.spacing().button_padding, egui::vec2(10.0, 4.0));
                     assert_eq!(ui.visuals().widgets.hovered.bg_fill, tokens.accent);
@@ -1652,6 +1789,31 @@ mod tests {
         }
     }
     use egui_kittest::{Harness, kittest::Queryable};
+
+    /// #3789: a plain text field is one boxed, outline-free input whose text-selection colour stays
+    /// local, so it isn't recoloured for the rest of the frame (selected rows, slider trails).
+    #[test]
+    fn text_field_is_a_boxed_input_whose_selection_colour_stays_local() {
+        use egui::accesskit::Role;
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut (String, egui::Color32, egui::Color32)| {
+                s.1 = ui.visuals().selection.bg_fill;
+                super::text_field(ui, egui::Id::new("tf"), &mut s.0, "hint", 140.0, false);
+                s.2 = ui.visuals().selection.bg_fill;
+            },
+            (String::new(), egui::Color32::WHITE, egui::Color32::BLACK),
+        );
+        crate::PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::Studio);
+        h.run();
+        assert_eq!(h.state().1, h.state().2, "the field's selection colour does not leak into its parent");
+        h.get_by_role(Role::TextInput).click();
+        h.run_steps(1);
+        for ch in "abc".chars() {
+            h.event(egui::Event::Text(ch.to_string()));
+            h.run_steps(1);
+        }
+        assert_eq!(h.state().0, "abc", "typing reaches the bound string");
+    }
 
     /// Sets up a test with one value field. Its state is its value and how many times it changed.
     fn field(value: f32, range: std::ops::RangeInclusive<f32>) -> Harness<'static, (f32, u32)> {

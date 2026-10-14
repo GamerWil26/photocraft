@@ -2,11 +2,15 @@
 //! has no menu item for them but lists them in Edit › Keyboard Shortcuts › Tools ("Decrease Brush
 //! Size"…); here they are ordinary commands with default shortcuts, so they can be rebound,
 //! recorded and driven by agents. Each one is a `tools.setBrush` on the session brush.
+//!
+//! `tools.rotateBrush` turns the tip: Photoshop's ← / → while painting (1°, ⇧ 15°). Arrows mean
+//! other things with other tools, so the shell gives them to it only for the painting tools
+//! (`move_mods::arrow_keys`).
 
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, always};
-use crate::{Result, Session};
+use crate::{EngineError, Result, Session};
 
 /// Photoshop's largest brush diameter, in pixels.
 pub const MAX_SIZE: f32 = 5000.0;
@@ -35,6 +39,23 @@ fn hardness(s: &mut Session, up: bool) -> Result<Value> {
     crate::brush_cmds::set_brush(s, &json!({ "brush": { "hardness": hardness } }))
 }
 
+/// The brush angle turned by `degrees` (positive is anticlockwise, as the angle field counts),
+/// wrapped into Photoshop's -180..=180.
+fn turned(angle: f32, degrees: f32) -> f32 {
+    let a = (angle + degrees).rem_euclid(360.0);
+    if a > 180.0 { a - 360.0 } else { a }
+}
+
+fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
+    let by = p
+        .get("degrees")
+        .and_then(Value::as_f64)
+        .filter(|d| d.is_finite() && d.abs() <= 360.0)
+        .ok_or_else(|| EngineError::BadParams { cmd: "tools.rotateBrush".into(), msg: "`degrees` must be a number from -360 to 360".into() })?;
+    let angle = turned(s.tools.brush.angle, by as f32);
+    crate::brush_cmds::set_brush(s, &json!({ "brush": { "angle": angle } }))
+}
+
 macro_rules! key_cmd {
     ($id:literal, $label:literal, $sc:literal, $run:expr) => {
         CommandSpec { id: $id, label: $label, menu: &[], shortcut: Some($sc), params: "{}", enabled: always, run: $run, journal: true }
@@ -47,6 +68,16 @@ pub fn specs() -> Vec<CommandSpec> {
         key_cmd!("tools.increaseBrushSize", "Increase Brush Size", "]", |s, _| size(s, true)),
         key_cmd!("tools.decreaseBrushHardness", "Decrease Brush Hardness", "Shift+[", |s, _| hardness(s, false)),
         key_cmd!("tools.increaseBrushHardness", "Increase Brush Hardness", "Shift+]", |s, _| hardness(s, true)),
+        CommandSpec {
+            id: "tools.rotateBrush",
+            label: "Rotate Brush Tip",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"degrees":-360..360 (positive anticlockwise; ← / → while painting send 1, ⇧ 15)}"##,
+            enabled: always,
+            run: rotate,
+            journal: true,
+        },
     ]
 }
 
@@ -72,6 +103,21 @@ mod tests {
         assert_eq!(hardness_step(0.6, false), 0.25, "snaps to the quarter below the nearest");
         assert_eq!(hardness_step(1.0, true), 1.0);
         assert_eq!(hardness_step(0.0, false), 0.0);
+    }
+
+    #[test]
+    fn rotate_brush_turns_the_tip_and_wraps_at_180() {
+        assert_eq!(turned(0.0, 1.0), 1.0);
+        assert_eq!(turned(179.0, 15.0), -166.0);
+        assert_eq!(turned(-175.0, -15.0), 170.0);
+        assert_eq!(turned(180.0, 0.0), 180.0);
+        let mut s = Session::new();
+        s.execute("tools.rotateBrush", json!({"degrees": -15})).unwrap();
+        assert_eq!(s.tools.brush.angle, -15.0);
+        for bad in [json!({}), json!({"degrees": "x"}), json!({"degrees": 1e9}), json!(null)] {
+            assert!(s.execute("tools.rotateBrush", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(s.tools.brush.angle, -15.0);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Formulas are documented approximations of Photoshop behaviour. Exact matching is tuned in
 //! milestone M7 against Photoshop-rendered PSD composites (the oracle in `testkit`).
 
-use photocraft_color::SampleType;
-use photocraft_color::convert::{D50, SRGB_TO_XYZ_D50, XYZ_D50_TO_SRGB, mat3_mul, rgb_to_gray, srgb_to_linear};
+use photocraft_color::convert::{D50, SRGB_TO_XYZ_D50, XYZ_D50_TO_SRGB, lab_to_srgb, mat3_mul, rgb_to_gray, srgb_to_lab, srgb_to_linear};
+use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::Adjustment;
 use photocraft_doc::adjust::{CurvePoint, HueRange, LevelsChannel, ToneSpace, lut3d_len};
 
@@ -45,14 +45,16 @@ impl Transfer {
             t => t,
         }
     }
-    fn decode(self, v: f32) -> f32 {
+    /// Tone-encoded value → linear light.
+    pub fn decode(self, v: f32) -> f32 {
         match self {
             Transfer::Srgb => photocraft_color::convert::srgb_to_linear(v.max(0.0)),
             Transfer::Gamma(1.0) => v.max(0.0),
             Transfer::Gamma(g) => v.max(0.0).powf(g),
         }
     }
-    fn encode(self, v: f32) -> f32 {
+    /// Linear light → tone-encoded value.
+    pub fn encode(self, v: f32) -> f32 {
         match self {
             Transfer::Srgb => photocraft_color::convert::linear_to_srgb(v.max(0.0)),
             Transfer::Gamma(1.0) => v.max(0.0),
@@ -92,11 +94,8 @@ pub fn apply_depth(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth
             // 27.11, brightness +40 with contrast +30 maps 128 to 185 (brightness first), while
             // the corpus's brightness -23 with contrast -26 (psd-tools) needs contrast first;
             // contrast 80 keeps 128 at 128 (a 0.5 pivot moved it to 130).
-            let b = brightness / 255.0;
-            let c = contrast.clamp(-100.0, 99.0);
-            let k = if c >= 0.0 { 1.0 / (1.0 - c / 100.0) } else { 1.0 + c / 100.0 };
-            let (pre, post) = if c >= 0.0 { (b, 0.0) } else { (0.0, b) };
-            map_rgb(buf, |px| px.map(|v| ((v + pre - LEGACY_PIVOT) * k + LEGACY_PIVOT + post).clamp(0.0, 1.0)))
+            let f = legacy_brightness_contrast(*brightness, *contrast);
+            map_rgb(buf, |px| px.map(&f))
         }
         Adjustment::BrightnessContrast { brightness, contrast, .. } => {
             // Modern (CS3+) Brightness/Contrast, reverse-engineered from Photoshop ground truth
@@ -159,14 +158,16 @@ pub fn apply_depth(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth
             map_rgb(buf, |c| {
                 let (dh, ds, dl) = match &table {
                     Some(t) => {
-                        // Range edits follow the pixel's original hue, faded out towards grey (greys have no hue).
+                        // Range edits follow the pixel's original hue, in full however dull the colour
+                        // (Photoshop's merged images, #4089). Greys stay grey: no hue to shift, no
+                        // saturation to scale, and range Lightness moves towards a channel they share.
                         let h0 = rgb_to_hsl(c).0;
-                        let chroma = ((c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])) * 4.0).min(1.0);
-                        (lut(&t[0], h0) * chroma, lut(&t[1], h0) * chroma, lut(&t[2], h0) * chroma)
+                        (lut(&t[0], h0), lut(&t[1], h0), lut(&t[2], h0))
                     }
                     None => (0.0, 0.0, 0.0),
                 };
-                hue_saturation(c, *hue + dh, (*saturation / 100.0 + ds).clamp(-1.0, 1.0), (*lightness / 100.0 + dl).clamp(-1.0, 1.0), *colorize)
+                let out = hue_saturation(c, *hue + dh, (*saturation / 100.0 + ds).clamp(-1.0, 1.0), (*lightness / 100.0).clamp(-1.0, 1.0), *colorize);
+                range_lightness(out, dl)
             })
         }
         Adjustment::Vibrance { vibrance, saturation } => {
@@ -191,7 +192,9 @@ pub fn apply_depth(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth
         Adjustment::BlackWhite { weights, tint } => map_rgb(buf, |c| {
             let g = black_white_gray(c, weights);
             match tint {
-                Some(t) => std::array::from_fn(|i| (g * t[i] * 2.0).clamp(0.0, 1.0) * 0.5 + g * 0.5),
+                // Photoshop tints like the Color blend mode: the tint's hue and saturation at the
+                // grey's luminosity (SetLum + ClipColor), measured in Photoshop 27.11.
+                Some(t) => photocraft_color::blend::set_lum(*t, g).map(|v| v.clamp(0.0, 1.0)),
                 None => [g; 3],
             }
         }),
@@ -233,6 +236,155 @@ pub fn apply_depth(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth
         }
         // Not evaluated: identity (still round-trips through PSD).
         Adjustment::ColorLookup { .. } | Adjustment::Unsupported { .. } => {}
+    }
+}
+
+/// Legacy Brightness/Contrast as one channel's tone curve (see [`apply_depth`]).
+fn legacy_brightness_contrast(brightness: f32, contrast: f32) -> impl Fn(f32) -> f32 {
+    let b = brightness / 255.0;
+    let c = contrast.clamp(-100.0, 99.0);
+    let k = if c >= 0.0 { 1.0 / (1.0 - c / 100.0) } else { 1.0 + c / 100.0 };
+    let (pre, post) = if c >= 0.0 { (b, 0.0) } else { (0.0, b) };
+    move |v: f32| ((v + pre - LEGACY_PIVOT) * k + LEGACY_PIVOT + post).clamp(0.0, 1.0)
+}
+
+/// Applies an adjustment in a document of colour `mode`: [`apply_depth`], except that in Lab
+/// and CMYK documents the adjustments Photoshop evaluates on the document's own channels do so
+/// (see [`lab_channel_adjustment`] and [`cmyk_channel_adjustment`]).
+pub fn apply_in(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth: Option<SampleType>, mode: ColorMode) {
+    if mode == ColorMode::Lab && lab_channel_adjustment(adj) {
+        apply_lab(adj, buf, depth);
+    } else if mode == ColorMode::Cmyk && cmyk_channel_adjustment(adj) {
+        use photocraft_color::convert::{cmyk_to_rgb, rgb_to_cmyk};
+        map_rgb(buf, |c| {
+            let mut ink = rgb_to_cmyk(c);
+            stored_channels(adj, mode, depth, &mut ink, rgb_to_gray(c));
+            cmyk_to_rgb(ink)
+        });
+    } else {
+        apply_depth(adj, buf, transfer, depth);
+    }
+}
+
+/// Whether a Lab document evaluates `adj` on its L, a and b channels rather than on the screen
+/// colour: Invert and Posterize (L, a and b alike), Brightness/Contrast (L only), Threshold
+/// (split on L, neutral result) and Gradient Map (driven by L). Levels and Curves carry their own
+/// Lab records ([`ToneSpace::Lab`]); everything else stays on the screen colour.
+pub fn lab_channel_adjustment(adj: &Adjustment) -> bool {
+    matches!(
+        adj,
+        Adjustment::Invert
+            | Adjustment::Posterize { .. }
+            | Adjustment::Threshold { .. }
+            | Adjustment::BrightnessContrast { .. }
+            | Adjustment::GradientMap { .. }
+    )
+}
+
+/// Whether a CMYK document evaluates `adj` on its inks rather than on the screen colour: Invert
+/// and Posterize (each ink, black included, so paper inverts to 400% ink) and Threshold (paper or
+/// 100% black ink alone). Photoshop corpus cmyk8 and cmyk16 invert, posterize-4 and threshold-128
+/// follow these rules on the files' own inks on every pixel; here the inks are the screen colour
+/// separated through the document's CMYK profile, so neutrals carry the black that profile
+/// generates rather than the file's.
+pub fn cmyk_channel_adjustment(adj: &Adjustment) -> bool {
+    stored_channel_adjustment(adj)
+}
+
+/// Whether [`stored_channels`] evaluates `adj`: Invert, Posterize and Threshold.
+pub fn stored_channel_adjustment(adj: &Adjustment) -> bool {
+    matches!(adj, Adjustment::Invert | Adjustment::Posterize { .. } | Adjustment::Threshold { .. })
+}
+
+/// Invert, Posterize or Threshold on one pixel's own channels in a Lab or CMYK document of
+/// `depth` (`None`: unknown, treated as 8-bit): `ch` holds L, a, b normalised as [`lab_norm`]
+/// gives them, or the C, M, Y, K inks (0: none); `gray` is the pixel's luma, which CMYK Threshold
+/// compares. Lab Invert turns 8-bit bytes `v` into `255 - v` (a becomes -1 - a) and mirrors a and
+/// b around neutral at 16 bits (photoshop corpus lab16 invert.psd: neutral stays neutral).
+pub fn stored_channels(adj: &Adjustment, mode: ColorMode, depth: Option<SampleType>, ch: &mut [f32], gray: f32) {
+    let lab = mode == ColorMode::Lab;
+    match adj {
+        Adjustment::Invert => {
+            let mirror = if lab && depth.is_some_and(|d| d != SampleType::U8) { 256.0 / 255.0 } else { 1.0 };
+            for (i, v) in ch.iter_mut().enumerate() {
+                *v = if i > 0 { mirror } else { 1.0 } - v.clamp(0.0, 1.0);
+            }
+        }
+        Adjustment::Posterize { levels } => ch.iter_mut().for_each(|v| *v = posterize(*v, *levels)),
+        Adjustment::Threshold { level } => {
+            // On the 8-bit grid, like the RGB threshold.
+            let t = (level * 255.0).round();
+            let out = if lab {
+                let white = ch.first().is_some_and(|l| (l.clamp(0.0, 1.0) * 255.0).round() >= t);
+                [if white { 1.0 } else { 0.0 }, 128.0 / 255.0, 128.0 / 255.0, 0.0]
+            } else {
+                [0.0, 0.0, 0.0, if (gray * 255.0).round() < t { 1.0 } else { 0.0 }]
+            };
+            ch.iter_mut().zip(out).for_each(|(v, o)| *v = o);
+        }
+        _ => {}
+    }
+}
+
+/// Encoded sRGB → Lab normalised the way Photoshop's channels hold it: L/100, (a+128)/255,
+/// (b+128)/255.
+fn lab_norm(c: [f32; 3]) -> [f32; 3] {
+    let l = srgb_to_lab(c);
+    [l[0] / 100.0, (l[1] + 128.0) / 255.0, (l[2] + 128.0) / 255.0]
+}
+
+/// The inverse of [`lab_norm`].
+fn lab_denorm(n: [f32; 3]) -> [f32; 3] {
+    lab_to_srgb([n[0] * 100.0, n[1] * 255.0 - 128.0, n[2] * 255.0 - 128.0])
+}
+
+/// The Lab evaluation of a [`lab_channel_adjustment`] in a document of `depth` (no-op for any
+/// other adjustment).
+fn apply_lab(adj: &Adjustment, buf: &mut Buffer, depth: Option<SampleType>) {
+    match adj {
+        // L → 100 - L and a, b mirrored about neutral; each channel posterized (see `stored_channels`).
+        Adjustment::Invert | Adjustment::Posterize { .. } => map_rgb(buf, |c| {
+            let mut n = lab_norm(c);
+            stored_channels(adj, ColorMode::Lab, depth, &mut n, 0.0);
+            lab_denorm(n)
+        }),
+        Adjustment::Threshold { level } => {
+            // Split on L alone (on the 8-bit grid); the result is neutral black or white.
+            let t = (level * 255.0).round();
+            map_rgb(buf, |c| [if (lab_norm(c)[0].clamp(0.0, 1.0) * 255.0).round() >= t { 1.0 } else { 0.0 }; 3])
+        }
+        Adjustment::BrightnessContrast { brightness, contrast, legacy } => {
+            let legacy_curve = legacy_brightness_contrast(*brightness, *contrast);
+            let curve = |v: f32| if *legacy { legacy_curve(v) } else { modern_contrast(modern_brightness(v, *brightness), *contrast).clamp(0.0, 1.0) };
+            // The tone curve on L only. Added as the difference of two round trips (like
+            // `tone_in_space`) so a and b, and colours a round trip moves, stay put.
+            map_rgb(buf, |c| {
+                let n = lab_norm(c);
+                let l = curve(n[0]);
+                if l == n[0] {
+                    return c;
+                }
+                let (before, after) = (lab_denorm(n), lab_denorm([l, n[1], n[2]]));
+                std::array::from_fn(|i| (c[i] + after[i] - before[i]).clamp(0.0, 1.0))
+            })
+        }
+        Adjustment::GradientMap { stops, reverse, dither } => {
+            let (w, x0, y0) = (buf.rect.width().max(1) as usize, buf.rect.x0, buf.rect.y0);
+            for (i, p) in buf.px.iter_mut().enumerate() {
+                if p[3] <= 0.0 {
+                    continue;
+                }
+                // Driven by L: equal lightness maps to the same stop colour whatever the chroma.
+                let l = lab_norm([p[0], p[1], p[2]])[0].clamp(0.0, 1.0);
+                let mut o = gradient(stops, if *reverse { 1.0 - l } else { l });
+                if *dither {
+                    let d = bayer4(x0 + (i % w) as i32, y0 + (i / w) as i32) / 255.0;
+                    o = o.map(|v| (v + d).clamp(0.0, 1.0));
+                }
+                p[..3].copy_from_slice(&o);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -293,7 +445,7 @@ pub fn tone_luts_depth(adj: &Adjustment, depth: Option<SampleType>) -> [Vec<f32>
 /// through the conversions the document's surfaces use. The change is added as a difference of
 /// two round trips, so channels a curve leaves alone (and out-of-gamut colours) stay exact.
 fn tone_in_space(space: ToneSpace, luts: &[Vec<f32>; 4], c: [f32; 3]) -> [f32; 3] {
-    use photocraft_color::convert::{cmyk_to_rgb, lab_to_srgb, rgb_to_cmyk, srgb_to_lab};
+    use photocraft_color::convert::{cmyk_to_rgb, rgb_to_cmyk};
     let (before, after) = match space {
         ToneSpace::Cmyk => {
             let ink = rgb_to_cmyk(c);
@@ -336,21 +488,32 @@ pub fn hue_range_tables(ranges: &[HueRange; 6]) -> [Vec<f32>; 3] {
 /// Colorize sets the hue and saturation instead of shifting them; at 0% it leaves only the
 /// lightness, as in Photoshop (#2326). Ticking Colorize in the dialog starts saturation at 25%.
 pub fn hue_saturation(c: [f32; 3], hue: f32, s: f32, l: f32, colorize: bool) -> [f32; 3] {
-    let (mut hh, mut ss, ll) = rgb_to_hsl(c);
+    let lighten = |v: f32| if l > 0.0 { v + (1.0 - v) * l } else { v * (1.0 + l) };
     if colorize {
-        hh = hue.rem_euclid(360.0) / 360.0;
-        ss = s.abs().min(1.0);
-    } else {
-        hh = (hh + hue / 360.0).rem_euclid(1.0);
-        ss = (ss * (1.0 + s)).clamp(0.0, 1.0);
+        // Colorize builds the colour at the lightened (or darkened) lightness, so black with
+        // Lightness +30 becomes a 30 % lightness colour, not grey (measured in Photoshop 27.11).
+        let (_, _, ll) = rgb_to_hsl(c);
+        return hsl_to_rgb(hue.rem_euclid(360.0) / 360.0, s.abs().min(1.0), lighten(ll));
     }
-    let mut rgb = hsl_to_rgb(hh, ss, ll);
-    if l > 0.0 {
-        rgb = rgb.map(|v| v + (1.0 - v) * l);
-    } else if l < 0.0 {
-        rgb = rgb.map(|v| v * (1.0 + l));
-    }
-    rgb
+    // Photoshop applies Lightness first, then rotates the hue and scales the saturation of the
+    // result: Hue +40, Saturation +25, Lightness -10 turns (240, 160, 30) into (173, 243, 0), not
+    // (168, 230, 14) (Photoshop 27.11 corpus file adjustments/rgb8/hue-saturation).
+    let (hh, ss, ll) = rgb_to_hsl(c.map(lighten));
+    let hh = (hh + hue / 360.0).rem_euclid(1.0);
+    // Raising saturation divides by 1 - s, lowering it multiplies by 1 + s: +50 % doubles it
+    // (measured in Photoshop 27.11); +100 % saturates any colour that has some.
+    let ss = if s > 0.0 { ss / (1.0 - s).max(1.0 / 512.0) } else { ss * (1.0 + s) }.clamp(0.0, 1.0);
+    hsl_to_rgb(hh, ss, ll)
+}
+
+/// A colour range's Lightness, applied after the master edits. It moves each channel towards the
+/// pixel's brightest channel when raised and towards its darkest when lowered, not towards white
+/// or black: Blues +50 turns (0, 29, 115) into (57, 71, 115), Blues -50 turns (102, 128, 204) into
+/// (102, 115, 153) (measured in Photoshop 27.11).
+pub fn range_lightness(c: [f32; 3], l: f32) -> [f32; 3] {
+    let l = l.clamp(-1.0, 1.0);
+    let target = if l > 0.0 { c[0].max(c[1]).max(c[2]) } else { c[0].min(c[1]).min(c[2]) };
+    c.map(|v| v + (target - v) * l.abs())
 }
 
 /// Black & White grey value. Each colour is the sum of a grey part (its smallest channel), a
@@ -387,6 +550,10 @@ pub fn bayer4(x: i32, y: i32) -> f32 {
 
 /// Samples a 3D LUT (`n`³ RGB triplets, red fastest) at `c`, trilinear or tetrahedral.
 pub fn lut3d_sample(lut: &[f32], n: usize, c: [f32; 3], tetrahedral: bool) -> [f32; 3] {
+    // A degenerate or short table can't be sampled: leave the colour alone.
+    if n < 2 || n.checked_pow(3).and_then(|c| c.checked_mul(3)).is_none_or(|len| lut.len() < len) {
+        return c;
+    }
     let m = (n - 1) as f32;
     let pos = c.map(|v| v.clamp(0.0, 1.0) * m);
     let i0 = pos.map(|p| (p.floor() as usize).min(n - 2));
@@ -438,8 +605,9 @@ const BALANCE_LEVELS: f32 = 0.39;
 /// - Preserve Luminosity off: a slider only moves its own channel. Midtones is gamma 2^−a.
 ///   Shadows is gamma 2^(−a/2) after a black point at 0.39·|a| when lowered; highlights is
 ///   gamma 2^(−a/2) after a white point at 1 − 0.39·a when raised.
-/// - Preserve Luminosity on: midtones is gamma 2^(−a/2) on the slider's channel and 2^(a/2) on
-///   the other two. Shadows and highlights go by the differences between a tone's three sliders:
+/// - Preserve Luminosity on: midtones uses gamma 2^((max(a) + min(a))/2 − a_ch),
+///   preserving the one-slider behaviour without summing offsets when multiple sliders move.
+///   Shadows and highlights go by the differences between a tone's three sliders:
 ///   each channel gets a plain black point at 0.39·(max − its own) for shadows and a plain white
 ///   point at 1 − 0.39·(its own − min) for highlights (so one raised shadows slider darkens the
 ///   other two channels, and two raised together darken only the third).
@@ -453,28 +621,27 @@ pub fn color_balance_channel(tones: [[f32; 3]; 3], preserve_luminosity: bool, ch
     let mut v = v.clamp(0.0, 1.0);
     for (tone, sliders) in [(2, highlights), (0, shadows), (1, midtones)] {
         let a: [f32; 3] = sliders.map(|s| (s / 100.0).clamp(-1.0, 1.0));
-        if preserve_luminosity && tone != 1 {
+        if preserve_luminosity {
             let own = a.get(ch).copied().unwrap_or(0.0);
             let (lo, hi) = a.iter().fold((f32::MAX, f32::MIN), |m, x| (m.0.min(*x), m.1.max(*x)));
-            v = if tone == 0 { black(v, BALANCE_LEVELS * (hi - own)) } else { white(v, 1.0 - BALANCE_LEVELS * (own - lo)) };
+            v = match tone {
+                0 => black(v, BALANCE_LEVELS * (hi - own)),
+                1 => v.powf(2f32.powf((hi + lo) / 2.0 - own)),
+                _ => white(v, 1.0 - BALANCE_LEVELS * (own - lo)),
+            };
             continue;
         }
         for (src, slider) in sliders.iter().enumerate() {
             let a = (slider / 100.0).clamp(-1.0, 1.0);
-            let own = src == ch;
-            if a == 0.0 || (!preserve_luminosity && !own) {
+            if a == 0.0 || src != ch {
                 continue;
             }
-            v = match (tone, preserve_luminosity) {
-                (1, false) => v.powf(2f32.powf(-a)),
-                (1, true) => v.powf(2f32.powf(if own { -a } else { a } / 2.0)),
-                (0, false) if a < 0.0 => black(v, BALANCE_LEVELS * -a).powf(2f32.powf(-a / 2.0)),
-                (0, false) => v.powf(2f32.powf(-a / 2.0)),
-
-                (2, false) if a > 0.0 => white(v, 1.0 - BALANCE_LEVELS * a).powf(2f32.powf(-a / 2.0)),
-                (2, false) => v.powf(2f32.powf(-a / 2.0)),
-
-                _ => v,
+            v = match tone {
+                1 => v.powf(2f32.powf(-a)),
+                0 if a < 0.0 => black(v, BALANCE_LEVELS * -a).powf(2f32.powf(-a / 2.0)),
+                0 => v.powf(2f32.powf(-a / 2.0)),
+                2 if a > 0.0 => white(v, 1.0 - BALANCE_LEVELS * a).powf(2f32.powf(-a / 2.0)),
+                _ => v.powf(2f32.powf(-a / 2.0)),
             };
         }
     }
@@ -502,10 +669,12 @@ pub fn selective_color_weights(c: [f32; 3]) -> [f32; 9] {
     ]
 }
 
-/// Photoshop Selective Color (approximation): each range shifts the cyan, magenta and yellow ink
-/// (1 − R, G, B) by its percentage, plus its black percentage on every ink, weighted by how much
-/// the colour belongs to the range. Relative mode scales the shift by the ink already present
-/// (so it can't tint pure white); absolute adds it outright.
+/// Photoshop Selective Color: each range shifts the cyan, magenta and yellow ink (1 − R, G, B) by
+/// its percentage, plus its black percentage on every ink, weighted by how much the colour belongs
+/// to the range. Relative mode scales the shift by the ink already present (so it can't tint pure
+/// white). Absolute mode scales it by the room the ink has: adding ink by min(1, 2 × (1 − ink)),
+/// removing it by min(1, 2 × ink), so Neutrals Cyan +50 darkens red 64 by 32, not 64 (all 72
+/// absolute range × ink cases within 1 level of Photoshop 27.11).
 pub fn selective_color(c: [f32; 3], relative: bool, adj: &[[f32; 4]; 9]) -> [f32; 3] {
     let w = selective_color_weights(c);
     let mut delta = [0.0f32; 3];
@@ -516,7 +685,14 @@ pub fn selective_color(c: [f32; 3], relative: bool, adj: &[[f32; 4]; 9]) -> [f32
         let a = adj[r].map(|v| v / 100.0);
         for i in 0..3 {
             let ink = 1.0 - c[i];
-            let d = if relative { (a[i] + a[3]) * ink } else { a[i] + a[3] };
+            let d = a[i] + a[3];
+            let d = if relative {
+                d * ink
+            } else if d > 0.0 {
+                d * (2.0 * (1.0 - ink)).min(1.0)
+            } else {
+                d * (2.0 * ink).min(1.0)
+            };
             delta[i] += d * wr;
         }
     }
@@ -938,6 +1114,30 @@ mod lookup_tests {
         }
     }
 
+    /// Photoshop 27.11, measured: absolute Selective Color on greys (red channel after one range's
+    /// cyan change).
+    #[test]
+    fn absolute_selective_color_matches_photoshop() {
+        // (range index, cyan %, grey, Photoshop's red)
+        let measured = [
+            (7, 50.0, 64u8, 32u8),
+            (7, 50.0, 192, 129),
+            (7, -50.0, 192, 223),
+            (7, -50.0, 64, 128),
+            (6, -50.0, 192, 224),
+            (6, -50.0, 240, 253),
+            (8, 50.0, 64, 32),
+            (8, 50.0, 16, 2),
+        ];
+        for (range, cyan, grey, want) in measured {
+            let mut adj = [[0.0f32; 4]; 9];
+            adj[range][0] = cyan;
+            let g = grey as f32 / 255.0;
+            let got = selective_color([g; 3], false, &adj)[0] * 255.0;
+            assert!((got - want as f32).abs() <= 1.5, "range {range} cyan {cyan} grey {grey}: {got} vs {want}");
+        }
+    }
+
     #[test]
     fn selective_color_zero_is_identity_and_ranges_are_local() {
         let zero = [[0.0f32; 4]; 9];
@@ -1051,6 +1251,26 @@ mod tone_tests {
                 assert!((r - i32::from(red[i])).abs() <= 1, "{tone} {amount} pl {preserve} at {x}: red {r} vs Photoshop {}", red[i]);
                 assert!((g - i32::from(green[i])).abs() <= 1, "{tone} {amount} pl {preserve} at {x}: green {g} vs Photoshop {}", green[i]);
             }
+        }
+    }
+
+    #[test]
+    fn color_balance_midtones_with_multiple_sliders_preserve_luminosity() {
+        // A shared offset depends on the two extremes, not the sum of moved sliders.
+        // The old per-slider product leaves red/blue unchanged for [30, 0, 30].
+        let tones = [[0.0; 3], [30.0, 0.0, 30.0], [0.0; 3]];
+        for input in [0.25_f32, 0.5, 0.75] {
+            for (ch, offset) in [-0.15_f32, 0.15, -0.15].into_iter().enumerate() {
+                let expected = input.powf(2f32.powf(offset));
+                let actual = color_balance_channel(tones, true, ch, input);
+                assert!((actual - expected).abs() < 1e-6, "channel {ch}, input {input}: {actual} vs {expected}");
+            }
+            // Preserve Luminosity off must still affect only the moved channels.
+            assert_eq!(color_balance_channel(tones, false, 1, input), input);
+            // One moved slider retains its previous half-strength compensation.
+            let single = [[0.0; 3], [30.0, 0.0, 0.0], [0.0; 3]];
+            assert!((color_balance_channel(single, true, 0, input) - input.powf(2f32.powf(-0.15))).abs() < 1e-6);
+            assert!((color_balance_channel(single, true, 1, input) - input.powf(2f32.powf(0.15))).abs() < 1e-6);
         }
     }
 
@@ -1193,6 +1413,82 @@ mod tone_tests {
         }
     }
 
+    /// Photoshop 27.11, measured: Hue/Saturation raising saturation, and Colorize with Lightness.
+    #[test]
+    fn hue_saturation_matches_photoshop() {
+        // (input, hue, saturation, lightness, colorize, Photoshop's output)
+        type Case = ([u8; 3], f32, f32, f32, bool, [u8; 3]);
+        let measured: [Case; 8] = [
+            ([204, 102, 102], 0.0, 50.0, 0.0, false, [254, 51, 51]),
+            ([204, 159, 102], 0.0, 50.0, 0.0, false, [254, 164, 51]),
+            ([204, 102, 102], 0.0, -50.0, 0.0, false, [178, 127, 127]),
+            ([0, 0, 0], 120.0, 100.0, 30.0, true, [0, 152, 0]),
+            ([28, 28, 28], 120.0, 100.0, 30.0, true, [0, 192, 0]),
+            ([160, 160, 160], 30.0, 25.0, -40.0, true, [120, 96, 73]),
+            ([252, 252, 252], 30.0, 25.0, -40.0, true, [177, 151, 126]),
+            ([255, 143, 0], 30.0, 25.0, -40.0, true, [95, 76, 58]),
+        ];
+        for (input, hue, saturation, lightness, colorize, want) in measured {
+            let a = Adjustment::HueSaturation { hue, saturation, lightness, colorize, ranges: HueRange::defaults() };
+            let c = input.map(|v| v as f32 / 255.0);
+            let mut b = Buffer { rect: Rect::new(0, 0, 1, 1), px: vec![[c[0], c[1], c[2], 1.0]] };
+            apply(&a, &mut b);
+            for (i, w) in want.iter().enumerate() {
+                let got = b.px[0][i] * 255.0;
+                assert!((got - *w as f32).abs() <= 2.0, "{input:?} h{hue} s{saturation} l{lightness} colorize {colorize}, channel {i}: {got} vs {w}");
+            }
+        }
+    }
+
+    /// Photoshop 27.11, measured: a range's Lightness (Blues ±50) moves towards the brightest or darkest channel.
+    #[test]
+    fn range_lightness_matches_photoshop() {
+        let measured = [
+            ([0u8, 29, 115], 0.5, [57u8, 71, 115]),
+            ([0, 64, 255], 0.5, [125, 157, 255]),
+            ([102, 128, 204], 0.5, [152, 165, 204]),
+            ([102, 128, 204], -0.5, [102, 115, 154]),
+            ([0, 18, 115], -0.5, [0, 9, 58]),
+        ];
+        for (input, l, want) in measured {
+            let got = range_lightness(input.map(|v| v as f32 / 255.0), l);
+            for i in 0..3 {
+                assert!((got[i] * 255.0 - want[i] as f32).abs() <= 2.5, "{input:?} channel {i}: {} vs {}", got[i] * 255.0, want[i]);
+            }
+        }
+    }
+
+    /// Photoshop's own render (merged image of psd-tools `adjustments/huesaturation_lightness_rgb.psd`,
+    /// layer "Hue/Saturation 1"): a dull magenta gets the whole range edit, as a vivid one does (#4089).
+    #[test]
+    fn hue_ranges_apply_in_full_to_dull_colours() {
+        let range = |lightness: f32, bounds: [f32; 4]| HueRange { hue: 0.0, saturation: 0.0, lightness, bounds };
+        let ranges = [
+            range(-11.0, [-57.0, 4.0, 82.0, 175.0]),
+            range(100.0, [12.0, 45.0, 75.0, 105.0]),
+            HueRange::neutral(2),
+            HueRange::neutral(3),
+            HueRange::neutral(4),
+            range(100.0, [-117.0, -50.0, 39.0, 104.0]),
+        ];
+        let a = Adjustment::HueSaturation { hue: 0.0, saturation: 0.0, lightness: 17.0, colorize: false, ranges };
+        let measured = [([126u8, 97, 120], [148u8, 148, 148]), ([131, 103, 125], [152, 152, 152]), ([95, 69, 90], [122, 122, 122])];
+        for (input, want) in measured {
+            let c = input.map(|v| v as f32 / 255.0);
+            let mut b = Buffer { rect: Rect::new(0, 0, 1, 1), px: vec![[c[0], c[1], c[2], 1.0]] };
+            apply(&a, &mut b);
+            for (i, w) in want.iter().enumerate() {
+                let got = b.px[0][i] * 255.0;
+                assert!((got - *w as f32).abs() <= 2.0, "{input:?} channel {i}: {got} vs {w}");
+            }
+        }
+        // Greys have no hue, so the ranges leave them alone: only the master Lightness moves them.
+        let mut b = Buffer { rect: Rect::new(0, 0, 1, 1), px: vec![[0.4, 0.4, 0.4, 1.0]] };
+        apply(&a, &mut b);
+        let p = b.px[0];
+        assert!((p[0] - p[1]).abs() < 1e-6 && (p[1] - p[2]).abs() < 1e-6 && (p[0] - (0.4 + 0.6 * 0.17)).abs() < 1e-4, "{p:?}");
+    }
+
     #[test]
     fn black_white_weights() {
         let d = [40.0, 60.0, 40.0, 60.0, 20.0, 80.0];
@@ -1202,6 +1498,31 @@ mod tone_tests {
         let mut w = d;
         w[0] = 100.0;
         assert!(black_white_gray([1.0, 0.0, 0.0], &w) > black_white_gray([1.0, 0.0, 0.0], &d));
+    }
+
+    /// Photoshop 27.11, measured: Black & White (default weights) with Tint over greys. The tint
+    /// is blended like the Color blend mode: its hue and saturation at the grey's luminosity.
+    #[test]
+    fn black_white_tint_matches_photoshop() {
+        let weights = [40.0, 60.0, 40.0, 60.0, 20.0, 80.0];
+        let measured: [([u8; 3], u8, [u8; 3]); 6] = [
+            ([255, 0, 0], 24, [81, 1, 1]),
+            ([255, 0, 0], 120, [255, 64, 64]),
+            ([255, 0, 0], 240, [255, 235, 235]),
+            ([0xe1, 0xd3, 0xb3], 120, [133, 119, 87]),
+            ([0xe1, 0xd3, 0xb3], 24, [33, 24, 1]),
+            ([0x40, 0x20, 0x10], 120, [144, 112, 96]),
+        ];
+        for (tint, grey, want) in measured {
+            let tint = Some(tint.map(|v| v as f32 / 255.0));
+            let mut b = Buffer { rect: Rect::new(0, 0, 1, 1), px: vec![[grey as f32 / 255.0; 4]] };
+            b.px[0][3] = 1.0;
+            apply(&Adjustment::BlackWhite { weights, tint }, &mut b);
+            for (i, w) in want.iter().enumerate() {
+                let got = b.px[0][i] * 255.0;
+                assert!((got - *w as f32).abs() <= 2.5, "tint {tint:?} grey {grey} channel {i}: {got} vs {w}");
+            }
+        }
     }
 
     #[test]
@@ -1214,8 +1535,162 @@ mod tone_tests {
         assert!(a.px.iter().zip(&b.px).all(|(x, y)| (x[0] - y[0]).abs() <= 0.5 / 255.0 + 1e-6));
         assert!(a.px.iter().zip(&b.px).any(|(x, y)| x[0] != y[0]));
     }
+
+    /// `adj` applied in a Lab document to one encoded sRGB colour, returned as (L, a, b).
+    fn in_lab(adj: &Adjustment, c: [f32; 3]) -> [f32; 3] {
+        let mut b = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [c[0], c[1], c[2], 1.0]);
+        apply_in(adj, &mut b, Transfer::Srgb, Some(SampleType::U8), ColorMode::Lab);
+        srgb_to_lab([b.px[0][0], b.px[0][1], b.px[0][2]])
+    }
+
+    /// A muted, in-gamut colour from (L, a, b).
+    fn lab(l: f32, a: f32, b: f32) -> [f32; 3] {
+        lab_to_srgb([l, a, b])
+    }
+
+    fn near(got: [f32; 3], want: [f32; 3], tol: f32) -> bool {
+        got.iter().zip(want).all(|(g, w)| (g - w).abs() <= tol)
+    }
+
+    #[test]
+    fn lab_invert_flips_l_a_and_b() {
+        let got = in_lab(&Adjustment::Invert, lab(30.0, 12.0, -18.0));
+        // n -> 1 - n: L -> 100 - L, a -> -a - 1, b -> -b - 1 (mirrored on the 0..255 grid).
+        assert!(near(got, [70.0, -13.0, 17.0], 0.6), "{got:?}");
+        // On the screen colour it would not be a mirror in Lab.
+        let mut rgb = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 1.0]);
+        let c = lab(30.0, 12.0, -18.0);
+        rgb.px[0] = [c[0], c[1], c[2], 1.0];
+        apply(&Adjustment::Invert, &mut rgb);
+        assert!(!near(srgb_to_lab([rgb.px[0][0], rgb.px[0][1], rgb.px[0][2]]), got, 1.0));
+    }
+
+    #[test]
+    fn sixteen_bit_lab_invert_keeps_greys_neutral() {
+        // 16-bit Lab Invert mirrors a and b around neutral (photoshop corpus lab16 invert.psd);
+        // 8-bit bytes land one step off it.
+        let mut b = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 1.0]);
+        let c = lab(40.0, 0.0, 0.0);
+        b.px[0] = [c[0], c[1], c[2], 1.0];
+        apply_in(&Adjustment::Invert, &mut b, Transfer::Srgb, Some(SampleType::U16), ColorMode::Lab);
+        let got = srgb_to_lab([b.px[0][0], b.px[0][1], b.px[0][2]]);
+        assert!(near(got, [60.0, 0.0, 0.0], 0.05), "{got:?}");
+        assert!(near(in_lab(&Adjustment::Invert, c), [60.0, -1.0, -1.0], 0.1));
+    }
+
+    /// `adj` applied in a CMYK document to one encoded sRGB colour.
+    fn in_cmyk(adj: &Adjustment, c: [f32; 3]) -> [f32; 3] {
+        let mut b = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [c[0], c[1], c[2], 1.0]);
+        apply_in(adj, &mut b, Transfer::Srgb, Some(SampleType::U8), ColorMode::Cmyk);
+        [b.px[0][0], b.px[0][1], b.px[0][2]]
+    }
+
+    #[test]
+    fn cmyk_invert_posterize_and_threshold_work_on_the_inks() {
+        use photocraft_color::convert::{cmyk_to_rgb, rgb_to_cmyk};
+        // Paper inverts to all four inks at 100%, not to RGB black (photoshop corpus cmyk8 invert.psd).
+        assert!(near(in_cmyk(&Adjustment::Invert, [1.0; 3]), cmyk_to_rgb([1.0; 4]), 2e-3));
+        let red = [0.9, 0.2, 0.1];
+        assert!(near(in_cmyk(&Adjustment::Invert, red), cmyk_to_rgb(rgb_to_cmyk(red).map(|v| 1.0 - v)), 2e-3));
+        let two = cmyk_to_rgb(rgb_to_cmyk(red).map(|v| if v >= 0.5 { 1.0 } else { 0.0 }));
+        assert!(near(in_cmyk(&Adjustment::Posterize { levels: 2 }, red), two, 2e-3));
+        // Threshold's black is the black ink alone (threshold-128.psd), its white the paper.
+        let t = Adjustment::Threshold { level: 0.5 };
+        assert!(near(in_cmyk(&t, [0.2; 3]), cmyk_to_rgb([0.0, 0.0, 0.0, 1.0]), 2e-3));
+        assert!(near(in_cmyk(&t, [0.8; 3]), cmyk_to_rgb([0.0; 4]), 2e-3));
+    }
+
+    #[test]
+    fn lab_posterize_steps_l_a_and_b() {
+        let got = in_lab(&Adjustment::Posterize { levels: 2 }, lab(70.0, 20.0, -30.0));
+        // Two levels: each normalised channel snaps to 0 or 1 (L 100, a and b at +127 / -128).
+        assert!(near(got, srgb_to_lab(lab_denorm([1.0, 1.0, 0.0])), 1e-3), "{got:?}");
+        let grey = in_lab(&Adjustment::Posterize { levels: 255 }, lab(50.0, 0.0, 0.0));
+        assert!(near(grey, [50.0, 0.0, 0.0], 1.1), "255 levels is within a step of the identity: {grey:?}");
+    }
+
+    #[test]
+    fn lab_threshold_splits_on_l_with_a_neutral_result() {
+        let t = Adjustment::Threshold { level: 0.5 };
+        // A saturated blue (L ≈ 32) and yellow (L ≈ 97): black and white, nothing in between.
+        for (c, white) in [([0.0, 0.0, 1.0], false), ([1.0, 1.0, 0.0], true), (lab(52.0, 40.0, 30.0), true), (lab(48.0, -40.0, 30.0), false)] {
+            let mut b = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [c[0], c[1], c[2], 1.0]);
+            apply_in(&t, &mut b, Transfer::Srgb, None, ColorMode::Lab);
+            let v = if white { 1.0 } else { 0.0 };
+            assert_eq!(b.px[0], [v, v, v, 1.0], "{c:?}");
+        }
+    }
+
+    #[test]
+    fn lab_brightness_contrast_moves_l_only() {
+        for legacy in [false, true] {
+            let adj = Adjustment::BrightnessContrast { brightness: 40.0, contrast: 30.0, legacy };
+            let before = [45.0, 15.0, -20.0];
+            let got = in_lab(&adj, lab(before[0], before[1], before[2]));
+            assert!(got[0] > before[0] + 5.0, "{legacy}: L rises: {got:?}");
+            assert!((got[1] - before[1]).abs() < 0.5 && (got[2] - before[2]).abs() < 0.5, "{legacy}: a, b kept: {got:?}");
+        }
+    }
+
+    #[test]
+    fn lab_gradient_map_follows_l() {
+        let stops = vec![(0.0, [1.0, 0.0, 0.0]), (1.0, [0.0, 0.0, 1.0])];
+        for reverse in [false, true] {
+            let map = Adjustment::GradientMap { stops: stops.clone(), reverse, dither: false };
+            // A grey and a saturated colour with the same L map to the same colour.
+            let grey = in_lab(&map, lab(60.0, 0.0, 0.0));
+            let green = in_lab(&map, lab(60.0, -50.0, 40.0));
+            assert!(near(grey, green, 1e-3), "{reverse}: {grey:?} vs {green:?}");
+            let t = if reverse { 0.4 } else { 0.6 };
+            let want = srgb_to_lab([1.0 - t, 0.0, t]);
+            assert!(near(grey, want, 0.05), "{reverse}: {grey:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn other_modes_and_adjustments_keep_the_screen_colour_path() {
+        let c = [0.2, 0.5, 0.7, 1.0];
+        let lab_only = [Adjustment::Invert, Adjustment::Threshold { level: 0.47 }, Adjustment::Posterize { levels: 4 }];
+        for adj in
+            lab_only.iter().chain([&Adjustment::HueSaturation { hue: 30.0, saturation: 0.0, lightness: 0.0, colorize: false, ranges: HueRange::defaults() }])
+        {
+            for mode in [ColorMode::Rgb, ColorMode::Cmyk, ColorMode::Grayscale, ColorMode::Lab] {
+                let (mut a, mut b) = (Buffer::filled(crate::Rect::new(0, 0, 1, 1), c), Buffer::filled(crate::Rect::new(0, 0, 1, 1), c));
+                apply_in(adj, &mut a, Transfer::Srgb, None, mode);
+                apply_depth(adj, &mut b, Transfer::Srgb, None);
+                let own = (mode == ColorMode::Lab && lab_channel_adjustment(adj)) || (mode == ColorMode::Cmyk && cmyk_channel_adjustment(adj));
+                assert_eq!(a.px == b.px, !own, "{adj:?} in {mode:?}");
+            }
+        }
+        // Transparent pixels are left alone and odd values never panic.
+        let mut t = Buffer::filled(crate::Rect::new(0, 0, 2, 1), [f32::NAN, 2.0, -1.0, 0.0]);
+        for adj in lab_only.iter().chain([&Adjustment::GradientMap { stops: vec![], reverse: true, dither: true }]) {
+            for mode in [ColorMode::Lab, ColorMode::Cmyk] {
+                apply_in(adj, &mut t, Transfer::Srgb, None, mode);
+                let mut odd = Buffer::filled(crate::Rect::new(0, 0, 1, 1), [f32::NAN, f32::INFINITY, -3.0, 1.0]);
+                apply_in(adj, &mut odd, Transfer::Srgb, Some(SampleType::U16), mode);
+            }
+        }
+        assert!(t.px[0][1] == 2.0);
+    }
 }
 
 /// Legacy Brightness/Contrast scales contrast around 128 of 255 (contrast 80 keeps 128 at 128,
 /// measured on Photoshop 27.11; a 0.5 pivot moved it to 130).
 pub const LEGACY_PIVOT: f32 = 128.0 / 255.0;
+
+#[cfg(test)]
+mod lut3d_guard_tests {
+    use super::lut3d_sample;
+
+    #[test]
+    fn degenerate_or_short_tables_leave_the_colour_alone() {
+        let c = [0.2, 0.4, 0.6];
+        for tetra in [false, true] {
+            assert_eq!(lut3d_sample(&[], 0, c, tetra), c);
+            assert_eq!(lut3d_sample(&[0.0; 3], 1, c, tetra), c);
+            assert_eq!(lut3d_sample(&[0.0; 3], 2, c, tetra), c);
+            assert_eq!(lut3d_sample(&[0.0; 24], usize::MAX, c, tetra), c);
+        }
+    }
+}

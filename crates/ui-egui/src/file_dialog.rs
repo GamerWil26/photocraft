@@ -21,12 +21,14 @@ use serde_json::{Value, json};
 use crate::PhotocraftApp;
 use crate::file_open::display_name;
 
-/// What a file dialog asks the user for.
+/// What a file or folder dialog asks the user for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileDialogRequest {
     /// Files to read: several for File › Open, one for a command that reads a file (Place,
     /// scripts, notes, presets). Starts in `initial_dir` (the last-used folder, UI-217-3).
     Open { multiple: bool, initial_dir: Option<String>, extensions: Option<Vec<String>> },
+    /// Which folder to read from. Starts in `initial_dir` when available.
+    Folder { initial_dir: Option<String> },
     /// Where to write, starting from `suggested` (a file name, or the document's own path).
     Save { suggested: String },
 }
@@ -42,6 +44,8 @@ pub enum FileDialogAnswer {
     ContentsMany(Vec<(String, Vec<u8>)>),
     /// The path to save to (desktop), or the download's name (web).
     SaveTo(String),
+    /// The selected folder's path (desktop).
+    FolderTo(String),
     /// No dialog could be shown (on Linux: no desktop portal and no zenity, #3354); the message
     /// says what to install. Reported as an error rather than taken for Cancel.
     Unavailable(String),
@@ -88,7 +92,7 @@ impl PhotocraftApp {
     }
 
     /// Show a file dialog; `then` continues with the user's choice on a later frame (see the
-    /// module docs). Returns at once with `{"fileDialog": "open" | "save"}`; `Err` without a
+    /// module docs). Returns at once with `{"fileDialog": "open" | "folder" | "save"}`; `Err` without a
     /// dialog service ("cancelled", as before there were async dialogs) or while one is open.
     pub(crate) fn ask_file(
         &mut self,
@@ -103,6 +107,7 @@ impl PhotocraftApp {
         }
         let kind = match request {
             FileDialogRequest::Open { .. } => "open",
+            FileDialogRequest::Folder { .. } => "folder",
             FileDialogRequest::Save { .. } => "save",
         };
         let then: Then = Box::new(move |app, answer| match answer {
@@ -112,6 +117,16 @@ impl PhotocraftApp {
         });
         self.file_dialog = Some(Pending { request: Some(request), answer: None, then });
         Ok(json!({ "fileDialog": kind }))
+    }
+
+    /// Ask the user to choose a folder, starting in the folder of the most recent file when known.
+    /// `then` receives the selected path when the dialog is answered.
+    pub(crate) fn ask_folder(&mut self, then: impl FnOnce(&mut Self, String) -> Result<Value, String> + 'static) -> Result<Value, String> {
+        let initial_dir = last_used_dir(&self.ui.recent_files);
+        self.ask_file(FileDialogRequest::Folder { initial_dir }, move |app, answer| match answer {
+            FileDialogAnswer::FolderTo(path) => then(app, path),
+            _ => Err(UNEXPECTED.into()),
+        })
     }
 
     /// Ask where to save: `then` gets the chosen path, with a lowercase extension when
@@ -134,9 +149,17 @@ impl PhotocraftApp {
         {
             suggested = dir.join(suggested);
         }
+        // The format comes from the extension, so a name typed without one (common where file
+        // extensions are hidden, #5039) gets the suggested file's extension, as Photoshop's
+        // Save As appends the extension of the chosen file type.
+        let suggested_ext = suggested.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
         self.ask_file(FileDialogRequest::Save { suggested: suggested.to_string_lossy().into_owned() }, move |app, answer| match answer {
             FileDialogAnswer::SaveTo(path) => {
                 let path = Self::lowercased_extension(app, path);
+                let path = match &suggested_ext {
+                    Some(ext) if Path::new(&path).extension().is_none() => Path::new(&path).with_extension(ext).to_string_lossy().into_owned(),
+                    _ => path,
+                };
                 // The web answers a download name, which has no folder to remember.
                 if let Some(doc) = doc
                     && let Some(dir) = Path::new(&path).parent().filter(|p| !p.as_os_str().is_empty())
@@ -193,6 +216,7 @@ impl PhotocraftApp {
                 }
                 FileDialogAnswer::Contents(name, bytes) => app.open_contents(vec![(name, bytes)]),
                 FileDialogAnswer::ContentsMany(files) => app.open_contents(files),
+                FileDialogAnswer::FolderTo(_) => return Err(UNEXPECTED.into()),
                 FileDialogAnswer::SaveTo(_) | FileDialogAnswer::Unavailable(_) => return Err(UNEXPECTED.into()),
             }
             Ok(Value::Null)
@@ -275,7 +299,7 @@ impl PhotocraftApp {
 }
 
 /// The folder an open dialog starts in: the directory of the most recent file (UI-217-3).
-fn last_used_dir(recent: &[String]) -> Option<String> {
+pub(crate) fn last_used_dir(recent: &[String]) -> Option<String> {
     let dir = std::path::Path::new(recent.first()?).parent()?;
     (!dir.as_os_str().is_empty()).then(|| dir.to_string_lossy().into_owned())
 }
@@ -290,6 +314,7 @@ fn read_picked(answer: FileDialogAnswer) -> Result<(String, Vec<u8>), String> {
             let bytes = photocraft_format::read_file(std::path::Path::new(&path)).map_err(|e| format!("{}: {e}", display_name(&path)))?;
             Ok((path, bytes))
         }
+        FileDialogAnswer::FolderTo(_) => Err(UNEXPECTED.into()),
         FileDialogAnswer::SaveTo(_) | FileDialogAnswer::Unavailable(_) => Err(UNEXPECTED.into()),
     }
 }

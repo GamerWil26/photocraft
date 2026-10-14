@@ -21,32 +21,11 @@ pub fn composite_layers(solo: &Document, format: photocraft_color::PixelFormat, 
         .reduce(|a, b| a.union(&b))
         .unwrap_or(Rect::EMPTY)
         .intersect(&canvas);
-    let mut surface = Surface::new(format);
     if area.is_empty() {
-        return surface;
+        return Surface::new(format);
     }
-
-    let channels = format.channels();
-    let mut data = Vec::new();
-    let _ = photocraft_compose::render_bands(solo, area, 0, |mut band| -> Result<(), ()> {
-        if let Some(color) = background {
-            for pixel in &mut band.px {
-                let alpha = pixel[3];
-                for channel in 0..3 {
-                    pixel[channel] = pixel[channel] * alpha + color[channel] * (1.0 - alpha);
-                }
-                pixel[3] = 1.0;
-            }
-        }
-        data.resize(band.px.len() * channels, 0.0);
-        for (pixel, encoded) in band.px.iter().zip(data.chunks_exact_mut(channels)) {
-            photocraft_raster::from_rgba_into(&format, *pixel, encoded);
-        }
-        surface.write_region(band.rect, &data);
-        Ok(())
-    });
-    surface.prune();
-    surface
+    // Also keeps a plain CMYK stack in its ink values (#3778).
+    photocraft_compose::composite_to_surface(solo, area, format, background)
 }
 
 /// Apply an adjustment destructively to a surface, weighted by an optional selection.
@@ -77,6 +56,9 @@ pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surf
     s.put_tiles(done);
 }
 
+#[cfg(test)]
+#[path = "flatten_cmyk_tests.rs"]
+mod flatten_cmyk_tests;
 #[cfg(test)]
 #[path = "pixels_tests.rs"]
 mod tests;
@@ -109,6 +91,9 @@ pub fn adjust_mask(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface
 /// `s`'s pixels over `r` (untouched ones included) with `adj` applied through the selection, encoded.
 fn adjusted(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) -> Vec<f32> {
     let fmt = s.format();
+    if fmt.mode == mode && matches!(mode, photocraft_color::ColorMode::Lab | photocraft_color::ColorMode::Cmyk) && adjust::stored_channel_adjustment(adj) {
+        return adjusted_channels(s, r, adj, selection);
+    }
     let n = fmt.channels();
     let raw = s.read_region(r);
     let mut buf = Buffer { rect: r, px: raw.chunks_exact(n).map(|p| to_rgba(&fmt, p)).collect() };
@@ -116,15 +101,66 @@ fn adjusted(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>,
     // 32-bit documents get the float behaviour of an adjustment layer there (Levels doesn't clip);
     // integer depths keep the unrounded, clipped curves.
     let depth = (fmt.sample == photocraft_color::SampleType::F32).then_some(fmt.sample);
-    adjust::apply_depth(adj, &mut buf, adjust::Transfer::for_document(mode, fmt.sample), depth);
-    let w = r.width() as usize;
-    let mut out = Vec::with_capacity(raw.len());
-    for (i, (a, o)) in buf.px.iter().zip(&orig.px).enumerate() {
-        let k = selection.map_or(1.0, |sel| sel.sample_channel(r.x0 + (i % w) as i32, r.y0 + (i / w) as i32, 0));
-        let mixed: [f32; 4] = std::array::from_fn(|c| o[c] + (a[c] - o[c]) * k);
-        let mut enc = [0.0f32; 8];
-        let m = photocraft_raster::from_rgba_into(&fmt, mixed, &mut enc);
-        out.extend_from_slice(&enc[..m]);
+    adjust::apply_in(adj, &mut buf, adjust::Transfer::for_document(mode, fmt.sample), depth, mode);
+    mix_through_selection(&fmt, r, &orig.px, &buf.px, selection)
+}
+
+/// [`adjusted`] for an adjustment Photoshop applies to a Lab or CMYK layer's own channels
+/// (`adjust::stored_channels`): exact on the stored values, with no trip through RGB, and mixed
+/// through the selection on those values (alpha untouched).
+fn adjusted_channels(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>) -> Vec<f32> {
+    let fmt = s.format();
+    let (n, colors) = (fmt.channels(), fmt.mode.color_channels());
+    let mut raw = s.read_region(r);
+    let w = (r.width() as usize).max(1);
+    let mut coverage = vec![1.0f32; w];
+    for (j, row) in raw.chunks_mut(w * n).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for (px, &k) in row.chunks_exact_mut(n).zip(&coverage) {
+            if k <= 0.0 {
+                continue;
+            }
+            let p = to_rgba(&fmt, px);
+            let gray = photocraft_color::convert::rgb_to_gray([p[0], p[1], p[2]]);
+            let Some(ch) = px.get_mut(..colors) else { continue };
+            let mut out = [0.0f32; 4];
+            let Some(out) = out.get_mut(..colors) else { continue };
+            out.copy_from_slice(ch);
+            adjust::stored_channels(adj, fmt.mode, Some(fmt.sample), out, gray);
+            for (v, o) in ch.iter_mut().zip(out.iter()) {
+                *v += (o - *v) * k;
+            }
+        }
+    }
+    raw
+}
+
+/// `edited` mixed back over `orig` (straight RGBA over `r`, row-major) by the selection's
+/// coverage, encoded in `fmt`: what a destructive edit writes back through a selection.
+pub(crate) fn mix_through_selection(
+    fmt: &photocraft_color::PixelFormat,
+    r: Rect,
+    orig: &[[f32; 4]],
+    edited: &[[f32; 4]],
+    selection: Option<&Surface>,
+) -> Vec<f32> {
+    let w = (r.width() as usize).max(1);
+    let mut out = Vec::with_capacity(orig.len() * fmt.channels());
+    // The selection's coverage (channel 0) one row at a time, each of its tiles looked up once
+    // per row rather than once per pixel.
+    let mut coverage = vec![1.0f32; w];
+    for (j, (edited_row, orig_row)) in edited.chunks(w).zip(orig.chunks(w)).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for ((a, o), k) in edited_row.iter().zip(orig_row).zip(&coverage) {
+            let mixed: [f32; 4] = std::array::from_fn(|c| o[c] + (a[c] - o[c]) * k);
+            let mut enc = [0.0f32; 8];
+            let m = photocraft_raster::from_rgba_into(fmt, mixed, &mut enc);
+            out.extend_from_slice(&enc[..m]);
+        }
     }
     out
 }
@@ -296,9 +332,12 @@ pub fn remap_surface(s: &Surface, map: impl Fn(i32, i32) -> (i32, i32)) -> Surfa
 }
 
 /// Merge `upper` onto `lower` producing a raster layer (Layer → Merge Down).
-pub fn merge_down(doc_bounds: Rect, lower: &Layer, upper: &Layer, format: photocraft_color::PixelFormat) -> Layer {
+pub fn merge_down(doc: &Document, lower: &Layer, upper: &Layer) -> Layer {
+    let format = doc.pixel_format();
     let stack = vec![lower.clone(), upper.clone()];
-    let mut tmp = Document::new("merge", doc_bounds.size(), format.mode, format.sample);
+    let mut tmp = Document::new("merge", doc.size, format.mode, format.sample);
+    // The pair is read (and a CMYK one separated again) through the document's own profile.
+    tmp.icc_profile = doc.icc_profile.clone();
     tmp.layers = stack;
     let s = composite_layers(&tmp, format, None);
     let mut merged = Layer::new(lower.name.clone(), LayerContent::Raster(s));

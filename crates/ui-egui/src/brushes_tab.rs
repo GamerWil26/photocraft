@@ -2,9 +2,10 @@
 //! preview, name) or a grid of tips, with a size slider and a search field.
 //!
 //! Presets and groups are organised like Photoshop's panel: drag a preset within its group or
-//! into another group or folder (onto a preset, or onto a header to append), drag a group's
-//! header to reorder groups (a nested folder's header to reorder it among its sibling folders),
-//! and right-click for Rename and Delete. Groups hold nested folders ([`BrushPreset::folder`],
+//! into another group or folder (onto a preset, or onto a header to append), drag a group's or
+//! folder's header onto another header to put it inside that folder (or onto the header's upper
+//! edge to place it before, which reorders siblings and moves a folder out to the top level), and
+//! right-click for Rename and Delete. Groups hold nested folders ([`BrushPreset::folder`],
 //! e.g. an imported `.abr` file's own folders), drawn indented under their group and opened or
 //! closed like groups. Every change is a `brush.presets.*` command, so it is journaled, drivable,
 //! and persisted by the preset store.
@@ -16,9 +17,7 @@ use egui::{Color32, RichText, Sense, Stroke, pos2, vec2};
 use photocraft_engine::paint::{BrushPreset, MAX_BRUSH_SIZE};
 use serde_json::json;
 
-use crate::brush_panel::{
-    BrushesPanelState, BrushesView, Renaming, UNGROUPED, WIDTH, commit_gesture, full_uv, grouped_presets, new_preset_name, run_or_status,
-};
+use crate::brush_panel::{BrushesPanelState, BrushesView, Renaming, UNGROUPED, WIDTH, commit_gesture, full_uv, grouped_presets, run_or_status};
 use crate::brush_preview;
 use crate::theme::{self, Tokens};
 use crate::{PhotocraftApp, icons, widgets};
@@ -57,6 +56,15 @@ pub enum Action {
     MoveGroup {
         group: String,
         folder: Vec<String>,
+        before: Option<String>,
+    },
+    /// Move a group (`folder` empty) or nested folder into another folder: `into` is (group,
+    /// folder path, `[]` = directly in the group), or `None` for the top level (it becomes a
+    /// group). `before` is a folder (or top-level group) there to land before.
+    MoveInto {
+        group: String,
+        folder: Vec<String>,
+        into: Option<(String, Vec<String>)>,
         before: Option<String>,
     },
     /// View only: show the rename bar for a preset or group ([`preset_list`] applies it).
@@ -235,6 +243,20 @@ pub fn apply(app: &mut PhotocraftApp, acts: Vec<Action>) {
                 let mut p = json!({ "group": group, "before": before });
                 if !folder.is_empty() {
                     p["folder"] = json!(folder);
+                }
+                run_or_status(app, "brush.presets.moveGroup", p);
+            }
+            Action::MoveInto { group, folder, into, before } => {
+                let into = match into {
+                    Some((g, f)) => json!({ "group": g, "folder": f }),
+                    None => json!({}),
+                };
+                let mut p = json!({ "group": group, "into": into });
+                if !folder.is_empty() {
+                    p["folder"] = json!(folder);
+                }
+                if let Some(b) = before {
+                    p["before"] = json!(b);
                 }
                 run_or_status(app, "brush.presets.moveGroup", p);
             }
@@ -453,6 +475,22 @@ fn darker(c: Color32, f: f32) -> Color32 {
     Color32::from_rgba_unmultiplied((r as f32 * f).round() as u8, (g as f32 * f).round() as u8, (b as f32 * f).round() as u8, a)
 }
 
+/// Where a card's tip thumbnail goes in its `cell`. `number_h` is the height of the size number
+/// under it, `None` on compact cards (no number: the tip takes the cell whole). Otherwise the
+/// number keeps a band at the bottom of the cell and the tip is centred in what's left above it,
+/// at [`CARD_TIP_BASE`] × `scale` or that room's side, whichever is smaller, times the preset's
+/// [`crate::brush_sections::thumb_scale`]: big brushes still read bigger than small ones, and
+/// none of them reaches down over the number.
+fn card_tip_rect(cell: egui::Rect, number_h: Option<f32>, size: f32, scale: f32) -> egui::Rect {
+    let Some(number_h) = number_h else {
+        return egui::Rect::from_center_size(cell.center(), egui::Vec2::splat((cell.width().min(cell.height()) - 2.0).max(1.0)));
+    };
+    // The number sits 1 pt off the cell's bottom, with a 1 pt gap above it.
+    let room = egui::Rect::from_min_max(cell.min, pos2(cell.right(), (cell.bottom() - number_h - 2.0).max(cell.top())));
+    let side = (CARD_TIP_BASE * scale).min(room.width().min(room.height())).max(0.0) * crate::brush_sections::thumb_scale(size);
+    egui::Rect::from_center_size(room.center(), egui::Vec2::splat(if side.is_finite() { side.max(1.0) } else { 1.0 }))
+}
+
 /// One preset in the Brush Preset picker: a 2 × 2 grid whose bottom row (the name) spans both
 /// columns — tip at the top left, stroke preview at the top right. A part that's off loses its
 /// cell (the other takes the room): with only the tip and the name on, the name moves into the
@@ -523,18 +561,13 @@ fn preset_card(
         let tip_w = if tip_only { top.width() } else { (CARD_TIP_W * scale).min(top.width() * 0.5) };
         let cell = egui::Rect::from_min_size(top.left_top(), vec2(tip_w, top_h));
         let tip = brush_preview::tip_texture(ui.ctx(), &format!("brushes-tip:{}", p.name), &pb.tip, (pb.hardness, pb.angle, pb.roundness), 36, t.text);
-        let side = if compact { (cell.width().min(cell.height()) - 2.0).max(1.0) } else { CARD_TIP_BASE * scale * crate::brush_sections::thumb_scale(pb.size) };
-        let center = if compact { cell.center() } else { pos2(cell.center().x, cell.center().y - 2.0 * scale_h) };
-        let tr = egui::Rect::from_center_size(center, vec2(side, side));
+        let number =
+            (!compact).then(|| ui.painter().layout_no_wrap(format!("{}", pb.size.round() as i64), egui::FontId::proportional(CARD_NUM_FONT), t.text_faint));
+        let tr = card_tip_rect(cell, number.as_ref().map(|g| g.size().y), pb.size, scale);
         ui.painter().image(tip.id(), tr, full_uv(), Color32::WHITE);
-        if !compact {
-            ui.painter().text(
-                pos2(cell.center().x, cell.bottom() - 1.0),
-                egui::Align2::CENTER_BOTTOM,
-                format!("{}", pb.size.round() as i64),
-                egui::FontId::proportional(CARD_NUM_FONT),
-                t.text_faint,
-            );
+        if let Some(g) = number {
+            let at = pos2(cell.center().x - g.size().x / 2.0, cell.bottom() - 1.0 - g.size().y);
+            ui.painter().galley(at, g, t.text_faint);
         }
         x = cell.right();
     }
@@ -582,9 +615,41 @@ fn preset_card(
 /// Indent of one nested folder level.
 const FOLDER_INDENT: f32 = 16.0;
 
-/// A group's or nested folder's header: chevron, folder, name, count. Click toggles; drag
-/// reorders groups (a folder among its sibling folders); a preset dropped here moves to the end of
-/// the group or folder. `key` is the group key, `folder` the nested folder's path (empty for the
+/// What dropping the group or folder (`src_group`, `src_folder`; a group when `src_folder` is
+/// empty) on the header of (`group`, `folder`) does, as in Photoshop's Brushes panel: on the
+/// header's upper edge (`edge`) it lands before that folder, next to it (reordering when they are
+/// siblings); anywhere else it goes into that folder. `None` when the drop does nothing: onto
+/// itself, into one of its own folders, or into the folder it is already in.
+pub fn folder_drop(src_group: &str, src_folder: &[String], group: &str, folder: &[String], edge: bool) -> Option<Action> {
+    if src_group == group && folder.starts_with(src_folder) {
+        return None;
+    }
+    let src = (src_group.to_string(), src_folder.to_vec());
+    if !edge {
+        let parent = src_folder.split_last().map(|(_, p)| p);
+        if src_group == group && parent == Some(folder) {
+            return None;
+        }
+        return Some(Action::MoveInto { group: src.0, folder: src.1, into: Some((group.to_string(), folder.to_vec())), before: None });
+    }
+    match folder.split_last() {
+        // Before a top-level group: groups reorder; a nested folder moves out to the top level.
+        None if src_folder.is_empty() => Some(Action::MoveGroup { group: src.0, folder: src.1, before: Some(group.to_string()) }),
+        None => Some(Action::MoveInto { group: src.0, folder: src.1, into: None, before: Some(group.to_string()) }),
+        Some((leaf, parent)) => {
+            let sibling = src_group == group && src_folder.split_last().map(|(_, p)| p) == Some(parent);
+            if sibling {
+                Some(Action::MoveGroup { group: src.0, folder: src.1, before: Some(leaf.clone()) })
+            } else {
+                Some(Action::MoveInto { group: src.0, folder: src.1, into: Some((group.to_string(), parent.to_vec())), before: Some(leaf.clone()) })
+            }
+        }
+    }
+}
+
+/// A group's or nested folder's header: chevron, folder, name, count. Click toggles; a group or
+/// folder dragged here lands before it (its upper edge) or goes into it ([`folder_drop`]); a
+/// preset dropped here moves to the end of the group or folder. `key` is the group key, `folder` the nested folder's path (empty for the
 /// group), `label` the group's panel label.
 fn group_header(ui: &mut egui::Ui, label: &str, key: &str, folder: &[String], open: bool, count: usize, acts: &mut Vec<Action>) {
     let t = Tokens::get(ui.ctx());
@@ -616,31 +681,27 @@ fn group_header(ui: &mut egui::Ui, label: &str, key: &str, folder: &[String], op
         [] => BrushDrag::Group(key.to_string()),
         f => BrushDrag::Folder { group: key.to_string(), folder: f.to_vec() },
     };
-    // A folder moves among its siblings: same group, same parent, not itself.
-    let sibling = |g: &str, f: &[String]| {
-        g == key && !folder.is_empty() && f.len() == folder.len() && f != folder && f.split_last().map(|x| x.1) == folder.split_last().map(|x| x.1)
-    };
     resp.dnd_set_drag_payload(me);
+    // The upper third of the header places a dragged folder before this one; the rest drops it in.
+    let edge = ui.ctx().pointer_interact_pos().is_some_and(|p| p.y < r.top() + r.height() / 3.0);
+    let folder_action = |d: &BrushDrag| match d {
+        BrushDrag::Group(g) => folder_drop(g, &[], key, folder, edge),
+        BrushDrag::Folder { group, folder: f } => folder_drop(group, f, key, folder, edge),
+        BrushDrag::Preset(_) => None,
+    };
     if let Some(d) = resp.dnd_hover_payload::<BrushDrag>() {
-        match &*d {
-            BrushDrag::Group(g) if folder.is_empty() && g != key => widgets::drop_line(ui, r, false, false, &t),
-            BrushDrag::Folder { group, folder: f } if sibling(group, f) => widgets::drop_line(ui, r, false, false, &t),
-            BrushDrag::Preset(_) => {
+        match (&*d, folder_action(&d)) {
+            (BrushDrag::Preset(_), _) | (_, Some(Action::MoveInto { before: None, .. })) => {
                 ui.painter().rect_stroke(r, t.radius_sm, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
             }
+            (_, Some(_)) => widgets::drop_line(ui, r, false, false, &t),
             _ => {}
         }
     }
     if let Some(d) = resp.dnd_release_payload::<BrushDrag>() {
         match &*d {
-            BrushDrag::Group(g) if folder.is_empty() && g != key => {
-                acts.push(Action::MoveGroup { group: g.clone(), folder: Vec::new(), before: Some(key.to_string()) })
-            }
-            BrushDrag::Folder { group, folder: f } if sibling(group, f) => {
-                acts.push(Action::MoveGroup { group: group.clone(), folder: f.clone(), before: Some(shown.to_string()) })
-            }
             BrushDrag::Preset(n) => acts.push(Action::Move { name: n.clone(), group: key.to_string(), folder: Some(folder.to_vec()), index: None }),
-            _ => {}
+            other => acts.extend(folder_action(other)),
         }
     }
     if resp.clicked() {
@@ -892,7 +953,7 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         icons::paint(ui, egui::Rect::from_min_size(ui.cursor().min + vec2(0.0, 3.0), vec2(16.0, 16.0)), "search", 14.0, t.text_faint);
         ui.add_space(20.0);
-        ui.add(egui::TextEdit::singleline(&mut app.ui.brushes_panel.filter).hint_text(tl!("Search Brushes")).desired_width(WIDTH - 120.0));
+        widgets::text_field(ui, ui.id().with("brush-search"), &mut app.ui.brushes_panel.filter, tl!("Search Brushes"), WIDTH - 120.0, false);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let view = &mut app.ui.brushes_panel.view;
             let grid_tip = "Grid view";
@@ -923,9 +984,9 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             {
                 run_or_status(app, "brush.presets.delete", json!({ "name": name }));
             }
-            if icons::button(ui, "square-plus", 24.0, false, "Create new brush from the current settings").clicked() {
-                let name = new_preset_name(&app.session.tools.presets);
-                run_or_status(app, "brush.presets.save", json!({ "name": name }));
+            let new = icons::button(ui, "square-plus", 24.0, false, "Create new brush from the current settings");
+            if crate::brush_picker::named(new, "Create new brush from the current settings").clicked() {
+                crate::brush_preset_dialog::open(app, None);
             }
             if icons::button(ui, "folder-open", 24.0, false, "Import Brushes… (.abr)").clicked() {
                 let _ = app.open_dialog_file();
